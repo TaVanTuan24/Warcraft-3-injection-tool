@@ -14,7 +14,11 @@ def build_archive(source_dir: Path, output_path: Path, log_callback=None) -> Bui
     log("INFO", f"Rebuilding archive: {output_path}")
     handler = MpqHandler.auto_detect()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    handler.rebuild_archive(source_dir=source_dir, output_path=output_path)
+    handler.rebuild_archive(
+        source_dir=source_dir,
+        output_path=output_path,
+        log_callback=log,
+    )
     return BuildResult(output_path=output_path)
 
 

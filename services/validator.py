@@ -6,12 +6,22 @@ import re
 from pathlib import Path
 
 from jass_patcher import get_effective_patch_config
-from models import CampaignMapEntry, InputType, PatchConfig, PatchSelection, ValidationResult
+from models import (
+    CampaignMapEntry,
+    InputType,
+    MapSourceContext,
+    PatchConfig,
+    PatchSelection,
+    ValidationResult,
+)
 from services.input_detector import detect_input_type
 from utils import ensure_output_target_is_safe
 
 
-GLOBALS_PATTERN = re.compile(r"^[ \t]*globals\b", re.IGNORECASE | re.MULTILINE)
+GLOBALS_PATTERN = re.compile(
+    r"^[ \t]*globals\b.*?^[ \t]*endglobals\b",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
 MAIN_PATTERN = re.compile(
     r"^[ \t]*function[ \t]+main[ \t]+takes[ \t]+nothing[ \t]+returns[ \t]+nothing\b",
     re.IGNORECASE | re.MULTILINE,
@@ -28,11 +38,46 @@ def validate_map_source_text(source_text: str) -> list[str]:
     return issues
 
 
+def validate_loaded_map_source(map_source: MapSourceContext) -> ValidationResult:
+    """Validate the extracted workspace and resolved script path for a loaded map."""
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    if not map_source.extracted_dir.exists():
+        issues.append(f"Extracted workspace does not exist: {map_source.extracted_dir}")
+        return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
+    if not map_source.extracted_dir.is_dir():
+        issues.append(f"Extracted workspace is not a directory: {map_source.extracted_dir}")
+        return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
+
+    script_relative = map_source.script_relative_path.as_posix()
+    if not map_source.script_path.exists() or not map_source.script_path.is_file():
+        issues.append(
+            f"Script not found: detected path '{script_relative}' is missing from the extracted workspace."
+        )
+        return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
+
+    try:
+        source_text = map_source.script_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        issues.append(f"Script found but unreadable: {script_relative}. {exc}")
+        return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
+
+    for issue in validate_map_source_text(source_text):
+        issues.append(f"Invalid JASS structure in detected script '{script_relative}': {issue}")
+
+    if map_source.script_discovery_warning:
+        warnings.append(map_source.script_discovery_warning)
+
+    return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
+
+
 def validate_before_inject(
     input_map: Path | None,
     output_map: Path | None,
     selected_patch: PatchSelection,
     overwrite: bool = False,
+    map_source: MapSourceContext | None = None,
     source_text: str | None = None,
     campaign_maps: list[CampaignMapEntry] | None = None,
     stop_on_first_error: bool = False,
@@ -78,7 +123,14 @@ def validate_before_inject(
         return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
 
     if input_type.is_map:
-        if source_text is not None:
+        if map_source is not None:
+            loaded_validation = validate_loaded_map_source(map_source)
+            issues.extend(loaded_validation.issues)
+            warnings.extend(loaded_validation.warnings)
+            source_text = map_source.source_text
+            if source_text is not None:
+                warnings.extend(_effective_warnings(source_text, selected_patch))
+        elif source_text is not None:
             issues.extend(validate_map_source_text(source_text))
             warnings.extend(_effective_warnings(source_text, selected_patch))
     else:

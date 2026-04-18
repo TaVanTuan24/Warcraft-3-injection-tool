@@ -72,3 +72,29 @@ def detect_newline(text: str) -> str:
 def normalize_for_match(text: str) -> str:
     """Normalize text for exact-match style comparisons with stable whitespace handling."""
     return " ".join(text.strip().lower().split())
+
+
+def to_archive_path(file_path: Path, workspace_root: Path) -> str:
+    """Convert a workspace file path into a normalized archive-relative path."""
+    resolved_root = workspace_root.resolve()
+    resolved_file = file_path.resolve()
+
+    try:
+        relative_path = resolved_file.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Source path is not inside the workspace root: {resolved_file}"
+        ) from exc
+
+    archive_path = relative_path.as_posix().strip()
+    while archive_path.startswith("./"):
+        archive_path = archive_path[2:]
+    while archive_path.startswith(".\\"):
+        archive_path = archive_path[2:]
+
+    if archive_path in {"", ".", "./", ".\\"}:
+        raise ValueError(
+            f"Computed invalid archive path '{archive_path or '<empty>'}' for source file {resolved_file}"
+        )
+
+    return archive_path

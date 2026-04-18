@@ -157,6 +157,7 @@ class MainWindow(QMainWindow):
         self.remove_listfile_button = QPushButton("Remove Listfile")
         self.listfile_list = QListWidget()
         self.validation_label = QLabel()
+        self.detected_script_label = QLabel("Detected script: not loaded")
         self.listfile_notice_label = QLabel(
             "If a protected map cannot expose 'war3map.j', add one or more external listfiles "
             "below. These are used only with MPQEditor during archive extraction."
@@ -184,7 +185,9 @@ class MainWindow(QMainWindow):
         self.listfile_list.setMinimumHeight(64)
         self.listfile_list.setMaximumHeight(96)
         self.validation_label.setWordWrap(True)
+        self.detected_script_label.setWordWrap(True)
         self.listfile_notice_label.setWordWrap(True)
+        self.detected_script_label.setObjectName("supportNote")
         self.listfile_notice_label.setObjectName("supportNote")
 
         grid.addWidget(QLabel("Input archive"), 0, 0)
@@ -232,6 +235,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.listfile_notice_label, 4, 1, 1, 2)
         grid.addWidget(QLabel("State"), 5, 0)
         grid.addWidget(self.validation_label, 5, 1, 1, 2)
+        grid.addWidget(QLabel("Detected script"), 6, 0, alignment=Qt.AlignTop)
+        grid.addWidget(self.detected_script_label, 6, 1, 1, 2)
         section.layout.addLayout(grid)
         return section
 
@@ -883,6 +888,7 @@ class MainWindow(QMainWindow):
             output_map=self._output_path(),
             selected_patch=self._selection,
             overwrite=self.overwrite_checkbox.isChecked(),
+            map_source=self._map_source_context,
             source_text=self._loaded_map_text,
             campaign_maps=self.campaign_map_table.entries() if self._input_type == InputType.CAMPAIGN_W3N else None,
             stop_on_first_error=self._stop_on_first_error(),
@@ -1039,6 +1045,7 @@ class MainWindow(QMainWindow):
             self._campaign_context = None
             self.campaign_map_table.set_entries([])
             self.campaign_status_label.setText("No campaign loaded.")
+        self._update_detected_script_label()
 
     def _run_worker(self, mode: str, **kwargs) -> None:
         if self._worker_thread is not None and self._worker_thread.isRunning():
@@ -1079,7 +1086,11 @@ class MainWindow(QMainWindow):
             self._release_loaded_input_source()
             self._map_source_context = payload["map_context"]
             self._loaded_map_text = self._map_source_context.source_text
-            self._append_log("SUCCESS", "Map source loaded successfully.")
+            self._append_log(
+                "SUCCESS",
+                "Map source loaded successfully. "
+                f"Detected script: {self._map_source_context.script_relative_path.as_posix()}",
+            )
         else:
             self._release_loaded_input_source()
             self._campaign_context = payload["campaign_context"]
@@ -1089,6 +1100,7 @@ class MainWindow(QMainWindow):
                 "SUCCESS",
                 f"Campaign scan complete. Found {len(payload['campaign_maps'])} embedded map archive(s).",
             )
+        self._update_detected_script_label()
         self._refresh_preview()
         self.status_run_label.setText("State: Ready")
         self._update_ui_state()
@@ -1172,6 +1184,17 @@ class MainWindow(QMainWindow):
         self.preview_merged.setPlainText(
             "\n".join(merged_lines).strip() or "// Nothing will be inserted"
         )
+
+    def _update_detected_script_label(self) -> None:
+        if self._map_source_context is not None:
+            self.detected_script_label.setText(
+                f"Detected script: {self._map_source_context.script_relative_path.as_posix()}"
+            )
+            return
+        if self._campaign_context is not None:
+            self.detected_script_label.setText("Detected script: campaign mode")
+            return
+        self.detected_script_label.setText("Detected script: not loaded")
 
     def _format_campaign_status(self) -> str:
         entries = self.campaign_map_table.entries()

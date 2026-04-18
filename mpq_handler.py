@@ -12,7 +12,7 @@ from typing import Sequence
 
 from app_paths import app_root, bundle_root
 from models import MpqBackendInfo, MpqBackendType
-from utils import ArchiveProcessingError
+from utils import ArchiveProcessingError, to_archive_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -32,6 +32,14 @@ class BackendCommand:
 
     args: tuple[str, ...]
     cwd: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveBuildEntry:
+    """One file that should be written into the rebuilt archive."""
+
+    source_path: Path
+    archive_path: str
 
 
 class BaseMpqBackendAdapter:
@@ -58,6 +66,7 @@ class BaseMpqBackendAdapter:
         backend: MpqBackendInfo,
         source_dir: Path,
         output_path: Path,
+        archive_entries: Sequence[ArchiveBuildEntry],
     ) -> tuple[BackendCommand, ...]:
         """Return the backend commands used to rebuild a map archive."""
         raise NotImplementedError
@@ -93,6 +102,7 @@ class MpqCliBackendAdapter(BaseMpqBackendAdapter):
         backend: MpqBackendInfo,
         source_dir: Path,
         output_path: Path,
+        archive_entries: Sequence[ArchiveBuildEntry],
     ) -> tuple[BackendCommand, ...]:
         return (
             BackendCommand(
@@ -137,23 +147,48 @@ class MpqEditorBackendAdapter(BaseMpqBackendAdapter):
         backend: MpqBackendInfo,
         source_dir: Path,
         output_path: Path,
+        archive_entries: Sequence[ArchiveBuildEntry],
     ) -> tuple[BackendCommand, ...]:
-        return (
-            BackendCommand(
-                args=(str(backend.executable), "new", str(output_path))
-            ),
+        commands: list[BackendCommand] = [
+            BackendCommand(args=(str(backend.executable), "new", str(output_path))),
             BackendCommand(
                 args=(
                     str(backend.executable),
                     "add",
                     str(output_path),
                     "*",
+                    ".",
                     "/auto",
                     "/r",
                 ),
                 cwd=source_dir,
             ),
-        )
+        ]
+
+        rename_candidates = [
+            entry
+            for entry in archive_entries
+            if not entry.archive_path.startswith("(")
+        ]
+        chunk_size = 500
+        for index in range(0, len(rename_candidates), chunk_size):
+            chunk = rename_candidates[index:index + chunk_size]
+            script_path = source_dir.parent / f"__mpqeditor_rebuild_rename_{index // chunk_size:03d}.txt"
+            script_lines = []
+            for entry in chunk:
+                mpqeditor_path = _to_mpqeditor_archive_path(entry.archive_path)
+                script_lines.append(
+                    f'rename "{output_path}" ".\\{mpqeditor_path}" "{mpqeditor_path}"'
+                )
+            script_lines.extend(["close", "exit"])
+            script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+            commands.append(
+                BackendCommand(
+                    args=(str(backend.executable), "/console", str(script_path))
+                )
+            )
+
+        return tuple(commands)
 
 
 BACKEND_ADAPTERS: dict[MpqBackendType, BaseMpqBackendAdapter] = {
@@ -307,17 +342,33 @@ class MpqHandler:
             external_listfiles=external_listfiles,
         )
 
-    def rebuild_archive(self, source_dir: Path, output_path: Path) -> None:
+    def rebuild_archive(self, source_dir: Path, output_path: Path, log_callback=None) -> None:
         """Rebuild a supported Warcraft 3 archive from an extracted directory."""
+        log = log_callback or (lambda _severity, _message: None)
         if not source_dir.is_dir():
             raise ArchiveProcessingError(
                 f"Cannot rebuild archive: source directory does not exist: {source_dir}"
+            )
+
+        archive_entries = self._collect_archive_entries(source_dir, log)
+        if not archive_entries:
+            raise ArchiveProcessingError(
+                f"Cannot rebuild archive: no valid files were found under {source_dir}"
+            )
+        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
+            rename_candidates = len(
+                [entry for entry in archive_entries if not entry.archive_path.startswith("(")]
+            )
+            log(
+                "INFO",
+                f"MPQEditor rebuild will normalize {rename_candidates} archive path(s) after import.",
             )
 
         commands = self._adapter.build_rebuild_commands(
             backend=self.backend,
             source_dir=source_dir,
             output_path=output_path,
+            archive_entries=archive_entries,
         )
         self._run_backend_commands(
             commands=commands,
@@ -328,9 +379,13 @@ class MpqHandler:
                 f"MPQ backend completed without creating the expected output file: {output_path}"
             )
 
-    def rebuild_map(self, source_dir: Path, output_path: Path) -> None:
+    def rebuild_map(self, source_dir: Path, output_path: Path, log_callback=None) -> None:
         """Backwards-compatible wrapper for map rebuild."""
-        self.rebuild_archive(source_dir=source_dir, output_path=output_path)
+        self.rebuild_archive(
+            source_dir=source_dir,
+            output_path=output_path,
+            log_callback=log_callback,
+        )
 
     def _validate_input_archive_path(self, input_path: Path) -> None:
         """Validate the input archive path."""
@@ -404,6 +459,29 @@ class MpqHandler:
                 seen_entries.add(entry_key)
                 merged_entries.append(entry)
         return merged_entries
+
+    def _collect_archive_entries(
+        self,
+        source_dir: Path,
+        log_callback,
+    ) -> tuple[ArchiveBuildEntry, ...]:
+        """Build a normalized archive file manifest from a workspace root."""
+        log_callback("INFO", f"Rebuild workspace root: {source_dir}")
+
+        entries: list[ArchiveBuildEntry] = []
+        for source_path in sorted(path.resolve() for path in source_dir.rglob("*") if path.is_file()):
+            try:
+                archive_path = to_archive_path(source_path, source_dir)
+            except ValueError as exc:
+                log_callback("WARNING", f"Skipped invalid archive entry: {exc}")
+                continue
+
+            log_callback("DEBUG", f"Source file: {source_path}")
+            log_callback("DEBUG", f"Computed archive path: {archive_path}")
+            entries.append(ArchiveBuildEntry(source_path=source_path, archive_path=archive_path))
+
+        log_callback("INFO", f"Total files queued for archive rebuild: {len(entries)}")
+        return tuple(entries)
 
     def _run_backend_commands(
         self,
@@ -482,3 +560,8 @@ class MpqHandler:
     def _format_command_for_log(self, command: BackendCommand) -> str:
         """Format a command for logs and error messages."""
         return subprocess.list2cmdline(list(command.args))
+
+
+def _to_mpqeditor_archive_path(archive_path: str) -> str:
+    """Convert a normalized archive path into MPQEditor's preferred separator style."""
+    return archive_path.replace("/", "\\")

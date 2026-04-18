@@ -3,14 +3,36 @@
 from __future__ import annotations
 
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from models import InputType, MapSourceContext, MpqBackendType
 from mpq_handler import MpqHandler
 from services.input_detector import detect_input_type
-from services.validator import validate_map_source_text
+from services.validator import validate_loaded_map_source
 from utils import ArchiveProcessingError, cleanup_workspace
+
+
+KNOWN_SCRIPT_RELATIVE_PATHS = (
+    Path("war3map.j"),
+    Path("scripts") / "war3map.j",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MapScriptDiscovery:
+    """Resolved map script selection details."""
+
+    selected_path: Path
+    selected_relative_path: Path
+    candidate_paths: tuple[Path, ...]
+    warning: str | None = None
+
+
+def find_map_script(extracted_root: Path, log_callback=None) -> Path:
+    """Locate the most likely Warcraft 3 map script inside an extracted workspace."""
+    return _discover_map_script(extracted_root, log_callback=log_callback).selected_path
 
 
 def load_map_source(
@@ -48,27 +70,32 @@ def load_map_source(
             destination_dir=extracted_dir,
             external_listfiles=resolved_listfiles,
         )
-        war3map_j_path = extracted_dir / "war3map.j"
-        if not war3map_j_path.is_file():
-            message = "Missing required file 'war3map.j' in extracted map contents."
-            if resolved_listfiles:
-                message += " The selected listfile may be incomplete for this protected map."
-            else:
-                message += " Try adding a listfile if the map is protected or obfuscated."
-            raise ArchiveProcessingError(message)
-        source_text = war3map_j_path.read_text(encoding="utf-8")
-        issues = validate_map_source_text(source_text)
-        if issues:
-            raise ArchiveProcessingError(" ".join(issues))
-        return MapSourceContext(
+        discovery = _discover_map_script(extracted_dir, log_callback=log)
+        try:
+            source_text = discovery.selected_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ArchiveProcessingError(
+                f"Script found but unreadable: {discovery.selected_relative_path.as_posix()}. {exc}"
+            ) from exc
+
+        context = MapSourceContext(
             input_path=input_war3_archive,
             input_type=input_type,
             workspace_root=workspace_root,
             extracted_dir=extracted_dir,
-            war3map_j_path=war3map_j_path,
+            script_path=discovery.selected_path,
+            script_relative_path=discovery.selected_relative_path,
             source_text=source_text,
+            script_candidates=discovery.candidate_paths,
+            script_discovery_warning=discovery.warning,
             external_listfiles=resolved_listfiles,
         )
+        validation = validate_loaded_map_source(context)
+        if not validation.is_valid:
+            raise ArchiveProcessingError(" ".join(validation.issues))
+        for warning in validation.warnings:
+            log("WARNING", warning)
+        return context
     except Exception:
         cleanup_workspace(workspace_root, keep=False, logger=_TempLogger(log))
         raise
@@ -89,3 +116,120 @@ class _TempLogger:
 
     def debug(self, message: str, *args: object) -> None:
         self._callback("INFO", message % args if args else message)
+
+
+def _discover_map_script(extracted_root: Path, log_callback=None) -> MapScriptDiscovery:
+    """Resolve the most likely war3map.j candidate inside an extracted workspace."""
+    log = log_callback or (lambda _severity, _message: None)
+
+    if not extracted_root.exists():
+        raise ArchiveProcessingError(f"Extracted workspace does not exist: {extracted_root}")
+    if not extracted_root.is_dir():
+        raise ArchiveProcessingError(f"Extracted workspace is not a directory: {extracted_root}")
+
+    log("INFO", f"Searching for war3map.j in extracted workspace: {extracted_root}")
+
+    found_by_resolved_path: dict[Path, Path] = {}
+    for relative_path in KNOWN_SCRIPT_RELATIVE_PATHS:
+        candidate_path = (extracted_root / relative_path).resolve()
+        if candidate_path.is_file():
+            _register_candidate(extracted_root, candidate_path, found_by_resolved_path, log)
+
+    for candidate_path in extracted_root.rglob("*"):
+        if not candidate_path.is_file() or candidate_path.name != "war3map.j":
+            continue
+        _register_candidate(extracted_root, candidate_path.resolve(), found_by_resolved_path, log)
+
+    if not found_by_resolved_path:
+        log("ERROR", "No script found: war3map.j is missing from the extracted workspace.")
+        message = "Script not found: could not locate 'war3map.j' in extracted map contents."
+        if any(extracted_root.iterdir()):
+            message += " Normal extraction completed, but the map script was not present."
+        else:
+            message += " The extracted workspace is empty."
+        raise ArchiveProcessingError(message)
+
+    candidates = tuple(
+        sorted(
+            found_by_resolved_path,
+            key=lambda path: _candidate_sort_key(extracted_root, path),
+        )
+    )
+    if len(candidates) > 1:
+        candidate_list = ", ".join(
+            _relative_script_path(extracted_root, path).as_posix() for path in candidates
+        )
+        log("WARNING", f"Multiple script candidates detected: {candidate_list}")
+
+    selected_path = candidates[0]
+    selected_relative_path = _relative_script_path(extracted_root, selected_path)
+    ambiguity_group = [
+        path
+        for path in candidates
+        if _candidate_rank(extracted_root, path) == _candidate_rank(extracted_root, selected_path)
+    ]
+    if len(ambiguity_group) > 1 and selected_relative_path not in KNOWN_SCRIPT_RELATIVE_PATHS:
+        ambiguous_paths = ", ".join(
+            _relative_script_path(extracted_root, path).as_posix() for path in ambiguity_group
+        )
+        log("ERROR", f"Multiple script candidates are ambiguous: {ambiguous_paths}")
+        raise ArchiveProcessingError(
+            "Multiple matches ambiguous: found equally likely 'war3map.j' files at "
+            f"{ambiguous_paths}."
+        )
+
+    log("INFO", f"Selected script: {selected_relative_path.as_posix()}")
+
+    warning = None
+    if len(candidates) > 1:
+        warning = (
+            "Multiple script candidates detected; selected "
+            f"'{selected_relative_path.as_posix()}' using known-path and shortest-path priority."
+        )
+
+    return MapScriptDiscovery(
+        selected_path=selected_path,
+        selected_relative_path=selected_relative_path,
+        candidate_paths=candidates,
+        warning=warning,
+    )
+
+
+def _register_candidate(
+    extracted_root: Path,
+    candidate_path: Path,
+    found_by_resolved_path: dict[Path, Path],
+    log_callback,
+) -> None:
+    if candidate_path in found_by_resolved_path:
+        return
+    found_by_resolved_path[candidate_path] = candidate_path
+    log_callback(
+        "INFO",
+        f"Found candidate: {_relative_script_path(extracted_root, candidate_path).as_posix()}",
+    )
+
+
+def _candidate_sort_key(extracted_root: Path, candidate_path: Path) -> tuple[int, int, str]:
+    relative_path = _relative_script_path(extracted_root, candidate_path)
+    return (
+        _known_path_priority(relative_path),
+        len(relative_path.parts),
+        relative_path.as_posix(),
+    )
+
+
+def _candidate_rank(extracted_root: Path, candidate_path: Path) -> tuple[int, int]:
+    relative_path = _relative_script_path(extracted_root, candidate_path)
+    return (_known_path_priority(relative_path), len(relative_path.parts))
+
+
+def _known_path_priority(relative_path: Path) -> int:
+    try:
+        return KNOWN_SCRIPT_RELATIVE_PATHS.index(relative_path)
+    except ValueError:
+        return len(KNOWN_SCRIPT_RELATIVE_PATHS)
+
+
+def _relative_script_path(extracted_root: Path, candidate_path: Path) -> Path:
+    return candidate_path.relative_to(extracted_root)

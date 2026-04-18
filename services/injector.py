@@ -68,10 +68,10 @@ def inject_patch(
     """Inject enabled patch content into an extracted map source."""
     effective_selection = effective_selection_for_map(map_source.source_text, selected_patch)
     patch_result = patch_war3map_j(
-        map_source.war3map_j_path,
+        map_source.script_path,
         selection_to_patch_config(selected_patch),
     )
-    patched_text = map_source.war3map_j_path.read_text(encoding="utf-8")
+    patched_text = map_source.script_path.read_text(encoding="utf-8")
     map_source.source_text = patched_text
     return PatchedSourceResult(
         effective_selection=effective_selection,
@@ -119,6 +119,18 @@ def inject_and_build(
     )
     try:
         progress("validating target map")
+        log("INFO", f"Using detected script: {map_source.script_relative_path.as_posix()}")
+        validation = validate_before_inject(
+            input_map=input_map,
+            output_map=output_map,
+            selected_patch=selected_patch,
+            overwrite=options.overwrite,
+            map_source=map_source,
+        )
+        if not validation.is_valid:
+            raise ValueError("\n".join(validation.issues))
+        for warning in validation.warnings:
+            log("WARNING", warning)
         patched_source = inject_patch(map_source, selected_patch)
 
         progress("injecting globals")

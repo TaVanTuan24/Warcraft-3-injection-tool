@@ -162,9 +162,17 @@ class MapSourceContext:
     input_type: InputType
     workspace_root: Path
     extracted_dir: Path
-    war3map_j_path: Path
+    script_path: Path
+    script_relative_path: Path
     source_text: str
+    script_candidates: tuple[Path, ...] = field(default_factory=tuple)
+    script_discovery_warning: str | None = None
     external_listfiles: tuple[Path, ...] = field(default_factory=tuple)
+
+    @property
+    def war3map_j_path(self) -> Path:
+        """Backwards-compatible alias for the detected map script path."""
+        return self.script_path
 
 
 @dataclass(frozen=True, slots=True)
