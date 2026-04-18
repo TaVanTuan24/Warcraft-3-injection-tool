@@ -26,14 +26,11 @@ from PySide6.QtWidgets import (
 from models import (
     CampaignBuildSummary,
     CampaignContext,
-    CampaignMapEntry,
     FunctionEntry,
     GlobalEntry,
     InputType,
     MainCallEntry,
     MapSourceContext,
-    PatchMode,
-    PatchResult,
     PatchRunOptions,
     PatchSelection,
     TriggerImportResult,
@@ -43,7 +40,7 @@ from models import (
 from app_paths import get_app_directory
 from patch_config import load_patch_preset, save_patch_preset
 from services.campaign_loader import dispose_campaign_source
-from services.injector import effective_selection_for_map, inject_and_build_campaign, summarize_campaign_build
+from services.injector import effective_selection_for_map, summarize_campaign_build
 from services.input_detector import default_output_path, detect_input_type
 from services.map_loader import dispose_map_source
 from services.trigger_parser import (
@@ -372,20 +369,17 @@ class MainWindow(QMainWindow):
         self.load_input_button = QPushButton("Load Input Source")
         self.scan_trigger_button = QPushButton("Scan Trigger Files")
         self.validate_button = QPushButton("Validate")
-        self.inject_button = QPushButton("Inject & Build")
+        self.inject_button = QPushButton("Inject")
         self.save_preset_button = QPushButton("Save Patch Preset")
         self.load_preset_button = QPushButton("Load Patch Preset")
         self.reset_button = QPushButton("Reset")
         self.overwrite_checkbox = QCheckBox("Overwrite output")
         self.keep_temp_checkbox = QCheckBox("Keep temp workspace")
-        self.patch_mode_combo = QComboBox()
-        for mode in PatchMode:
-            self.patch_mode_combo.addItem(mode.label, mode)
 
         self.load_input_button.clicked.connect(self._load_input_source)
         self.scan_trigger_button.clicked.connect(self._scan_trigger_files)
         self.validate_button.clicked.connect(self._validate_current)
-        self.inject_button.clicked.connect(self._inject_and_build)
+        self.inject_button.clicked.connect(self._inject)
         self.save_preset_button.clicked.connect(self._save_preset)
         self.load_preset_button.clicked.connect(self._load_preset)
         self.reset_button.clicked.connect(self._reset_all)
@@ -403,10 +397,10 @@ class MainWindow(QMainWindow):
         )
 
         button_tooltips = {
-            self.load_input_button: "Load the selected map or campaign into the workspace.",
+            self.load_input_button: "Load the selected map script from the archive.",
             self.scan_trigger_button: "Parse all selected trigger files and import patchable content.",
-            self.validate_button: "Run pre-build validation using the current files and selections.",
-            self.inject_button: "Inject the selected content and build the output archive.",
+            self.validate_button: "Run pre-inject validation using the current files and selections.",
+            self.inject_button: "Inject the selected content and save the patched output archive.",
             self.save_preset_button: "Save the current selected patch entries to a preset file.",
             self.load_preset_button: "Load patch entries from a previously saved preset file.",
             self.reset_button: "Clear the current UI state and selections.",
@@ -420,9 +414,6 @@ class MainWindow(QMainWindow):
         self.inject_button.setMinimumWidth(152)
         self.save_preset_button.setMinimumWidth(152)
         self.load_preset_button.setMinimumWidth(152)
-        self.patch_mode_combo.setToolTip(
-            "Choose whether to try fast in-place script replacement, force full rebuild, or let Auto decide."
-        )
 
         primary_row = QHBoxLayout()
         primary_row.setContentsMargins(0, 0, 0, 0)
@@ -437,8 +428,6 @@ class MainWindow(QMainWindow):
         for button in library_buttons:
             secondary_row.addWidget(button)
         secondary_row.addSpacing(12)
-        secondary_row.addWidget(QLabel("Patch mode"))
-        secondary_row.addWidget(self.patch_mode_combo)
         secondary_row.addWidget(self.overwrite_checkbox)
         secondary_row.addWidget(self.keep_temp_checkbox)
         secondary_row.addStretch(1)
@@ -527,7 +516,7 @@ class MainWindow(QMainWindow):
         path = select_open_file(
             self,
             "Select Input Archive",
-            "Warcraft 3 Archives (*.w3x *.w3m *.w3n)",
+            "Warcraft Maps/Campaigns (*.w3x *.w3m *.w3n)",
         )
         if not path:
             return
@@ -940,11 +929,10 @@ class MainWindow(QMainWindow):
             output_map=self._output_path(),
             selected_patch=self._selection,
             overwrite=self.overwrite_checkbox.isChecked(),
-            patch_mode=self._selected_patch_mode(),
             map_source=self._map_source_context,
             source_text=self._loaded_map_text,
             campaign_maps=self.campaign_map_table.entries() if self._input_type == InputType.CAMPAIGN_W3N else None,
-            stop_on_first_error=self._stop_on_first_error(),
+            log_callback=self._append_log,
         )
         self._last_validation = validation
         if validation.is_valid:
@@ -962,19 +950,46 @@ class MainWindow(QMainWindow):
         self._refresh_preview()
         self._update_ui_state()
 
-    def _inject_and_build(self) -> None:
+    def _inject(self) -> None:
         if self.mode_combo.currentIndex() == 1:
             try:
                 self._sync_selection_from_raw_editors()
             except ToolError as exc:
-                show_error(self, "Inject & Build", str(exc))
+                show_error(self, "Inject", str(exc))
                 return
 
         input_path = self._input_path()
         output_path = self._output_path()
-        if input_path is None or output_path is None:
-            show_error(self, "Inject & Build", "Select valid input and output archive paths first.")
+        input_valid = bool(
+            input_path
+            and input_path.exists()
+            and self._input_type is not None
+        )
+        output_valid = bool(
+            output_path
+            and self._input_type is not None
+            and output_path.suffix.lower() == self._input_type.suffix
+        )
+        has_enabled_entries = self._has_enabled_patch_entries()
+        worker_running = self._worker_thread is not None and self._worker_thread.isRunning()
+        inject_ready, inject_reason = self._inject_readiness_state(
+            input_valid=input_valid,
+            output_valid=output_valid,
+            has_enabled_entries=has_enabled_entries,
+            worker_running=worker_running,
+        )
+        if not inject_ready:
+            show_error(self, "Inject", f"Inject is unavailable: {inject_reason}.")
             return
+        if input_path is None or output_path is None:
+            show_error(self, "Inject", "Select valid input and output archive paths first.")
+            return
+        if self._input_type == InputType.CAMPAIGN_W3N:
+            self._sync_campaign_entries_from_table()
+            self._append_log(
+                "INFO",
+                f"Selected {len(self.campaign_map_table.selected_entries())} campaign map(s) for patching.",
+            )
 
         overwrite = self.overwrite_checkbox.isChecked()
         if output_path.exists() and not overwrite:
@@ -996,17 +1011,11 @@ class MainWindow(QMainWindow):
                 overwrite=overwrite,
                 keep_temp=self.keep_temp_checkbox.isChecked(),
                 stop_on_first_error=self._stop_on_first_error(),
-                patch_mode=self._selected_patch_mode(),
             ),
         }
-        if self._input_type == InputType.CAMPAIGN_W3N:
-            if self._campaign_context is None:
-                show_error(self, "Inject & Build", "Load and scan a campaign before building.")
-                return
-            self._sync_campaign_entries_from_table()
+        if self._input_type == InputType.CAMPAIGN_W3N and self._campaign_context is not None:
             kwargs["campaign_context"] = self._campaign_context
             kwargs["campaign_maps"] = self.campaign_map_table.selected_entries()
-
         self._run_worker("inject-build", **kwargs)
 
     def _save_preset(self) -> None:
@@ -1052,13 +1061,12 @@ class MainWindow(QMainWindow):
         self._listfiles.clear()
         self.trigger_file_list.clear()
         self.listfile_list.clear()
+        self.campaign_map_table.set_entries([])
         self.input_path_edit.setText("")
         self.output_path_edit.setText("")
-        self.patch_mode_combo.setCurrentIndex(0)
         self.overwrite_checkbox.setChecked(False)
         self.keep_temp_checkbox.setChecked(False)
-        self.campaign_map_table.set_entries([])
-        self.campaign_status_label.setText("No campaign loaded.")
+        self.campaign_failure_combo.setCurrentIndex(0)
         self.log_panel.clear()
         self._input_type = None
         self._sync_raw_editors_from_selection()
@@ -1078,10 +1086,6 @@ class MainWindow(QMainWindow):
 
     def _external_listfiles(self) -> tuple[Path, ...]:
         return tuple(Path(path).expanduser().resolve() for path in self._listfiles)
-
-    def _selected_patch_mode(self) -> PatchMode:
-        mode = self.patch_mode_combo.currentData()
-        return mode if isinstance(mode, PatchMode) else PatchMode.AUTO
 
     def _stop_on_first_error(self) -> bool:
         return self.campaign_failure_combo.currentIndex() == 1
@@ -1148,8 +1152,8 @@ class MainWindow(QMainWindow):
 
     def _on_input_loaded(self, payload: dict) -> None:
         self._input_type = payload["input_type"]
+        self._release_loaded_input_source()
         if self._input_type is not None and self._input_type.is_map:
-            self._release_loaded_input_source()
             self._map_source_context = payload["map_context"]
             self._loaded_map_text = self._map_source_context.source_text
             self._append_log(
@@ -1158,7 +1162,6 @@ class MainWindow(QMainWindow):
                 f"Detected script: {self._map_source_context.script_relative_path.as_posix()}",
             )
         else:
-            self._release_loaded_input_source()
             self._campaign_context = payload["campaign_context"]
             self.campaign_map_table.set_entries(payload["campaign_maps"])
             self.campaign_status_label.setText(self._format_campaign_status())
@@ -1176,28 +1179,29 @@ class MainWindow(QMainWindow):
         if isinstance(result, CampaignBuildSummary):
             summary_text = summarize_campaign_build(result)
             self._append_log("SUCCESS", summary_text)
-            show_info(self, "Campaign Build Complete", summary_text)
-            self.status_run_label.setText("State: Built campaign")
-        else:
-            self._append_log(
-                "SUCCESS",
-                (
-                    f"Inject & Build completed: {result.output_path} "
-                    f"(globals={result.added_globals}, functions={result.added_functions}, "
-                    f"main calls={result.added_init_calls})"
-                ),
-            )
-            show_info(
-                self,
-                "Build Complete",
-                (
-                    f"Patched archive created:\n{result.output_path}\n\n"
-                    f"Added globals: {result.added_globals}\n"
-                    f"Added functions: {result.added_functions}\n"
-                    f"Added main calls: {result.added_init_calls}"
-                ),
-            )
-            self.status_run_label.setText("State: Built")
+            show_info(self, "Campaign Inject Complete", summary_text)
+            self.status_run_label.setText("State: Injected campaign")
+            self._update_ui_state()
+            return
+        self._append_log(
+            "SUCCESS",
+            (
+                f"Inject completed successfully: {result.output_path} "
+                f"(globals={result.added_globals}, functions={result.added_functions}, "
+                f"main calls={result.added_init_calls})"
+            ),
+        )
+        show_info(
+            self,
+            "Inject Complete",
+            (
+                f"Patched archive created:\n{result.output_path}\n\n"
+                f"Added globals: {result.added_globals}\n"
+                f"Added functions: {result.added_functions}\n"
+                f"Added main calls: {result.added_init_calls}"
+            ),
+        )
+        self.status_run_label.setText("State: Injected")
         self._update_ui_state()
 
     def _on_worker_failed(self, message: str) -> None:
@@ -1276,8 +1280,56 @@ class MainWindow(QMainWindow):
             f"unpatchable={failed}"
         )
 
+    def _has_enabled_patch_entries(self) -> bool:
+        return bool(
+            self._selection.enabled_globals()
+            or self._selection.enabled_functions()
+            or self._selection.enabled_main_calls()
+        )
+
+    def _inject_status_summary(self, inject_ready: bool, inject_reason: str) -> str:
+        mode_label = (
+            "campaign"
+            if self._input_type == InputType.CAMPAIGN_W3N
+            else "single map"
+        )
+        return (
+            f"Inject: {'enabled' if inject_ready else 'disabled'}"
+            f" ({mode_label} mode: {inject_reason})"
+        )
+
+    def _inject_readiness_state(
+        self,
+        input_valid: bool,
+        output_valid: bool,
+        has_enabled_entries: bool,
+        worker_running: bool,
+    ) -> tuple[bool, str]:
+        campaign_mode = self._input_type == InputType.CAMPAIGN_W3N
+        selected_campaign_maps = len(self.campaign_map_table.selected_entries())
+
+        if worker_running:
+            return False, "operation already running"
+        if not input_valid:
+            return False, "valid input archive required"
+        if not output_valid:
+            return False, "valid output path required"
+        if not has_enabled_entries:
+            return False, "no enabled patch content"
+        if campaign_mode:
+            if self._campaign_context is None:
+                return False, "campaign must be loaded successfully"
+            if selected_campaign_maps < 1:
+                return False, "select at least one embedded campaign map"
+            return True, f"campaign ready ({selected_campaign_maps} embedded map(s) selected)"
+        return True, "single map ready"
+
     def _update_ui_state(self) -> None:
-        input_valid = bool(self._input_path() and self._input_path().exists() and self._input_type is not None)
+        input_valid = bool(
+            self._input_path()
+            and self._input_path().exists()
+            and self._input_type is not None
+        )
         output_valid = bool(
             self._output_path()
             and self._input_type is not None
@@ -1285,33 +1337,41 @@ class MainWindow(QMainWindow):
         )
         has_trigger_files = bool(self._trigger_files)
         listfile_count = len(self._listfiles)
-        has_enabled_entries = bool(
-            self._selection.enabled_globals()
-            or self._selection.enabled_functions()
-            or self._selection.enabled_main_calls()
-        )
+        has_enabled_entries = self._has_enabled_patch_entries()
         worker_running = self._worker_thread is not None and self._worker_thread.isRunning()
         campaign_mode = self._input_type == InputType.CAMPAIGN_W3N
         selected_campaign_maps = len(self.campaign_map_table.selected_entries())
+        inject_ready, inject_reason = self._inject_readiness_state(
+            input_valid=input_valid,
+            output_valid=output_valid,
+            has_enabled_entries=has_enabled_entries,
+            worker_running=worker_running,
+        )
+        inject_status = self._inject_status_summary(
+            inject_ready=inject_ready,
+            inject_reason=inject_reason,
+        )
 
         self.campaign_section.setVisible(campaign_mode)
         if campaign_mode:
-            self.campaign_status_label.setText(self._format_campaign_status())
+            self.campaign_status_label.setText(
+                f"{self._format_campaign_status()} | {inject_status}"
+            )
 
         input_type_label = self._input_type.name if self._input_type is not None else "unknown"
-        patch_mode_label = self._selected_patch_mode().label
         self.validation_label.setText(
             " | ".join(
                 [
                     f"Input: {'ready' if input_valid else 'missing'}",
                     f"Type: {input_type_label}",
-                    f"Patch mode: {patch_mode_label}",
+                    "Patch mode: direct replace",
                     f"Output: {'ready' if output_valid else 'missing/invalid'}",
                     f"Trigger files: {len(self._trigger_files)}",
                     f"Listfiles: {listfile_count}",
                     f"Enabled items: {'yes' if has_enabled_entries else 'no'}",
                     f"Loaded target: {'map' if self._loaded_map_text else 'campaign' if self._campaign_context else 'not loaded'}",
                     f"Selected maps: {selected_campaign_maps if campaign_mode else 'n/a'}",
+                    inject_status,
                 ]
             )
         )
@@ -1325,21 +1385,11 @@ class MainWindow(QMainWindow):
         self.load_input_button.setEnabled(input_valid and not worker_running)
         self.scan_trigger_button.setEnabled(has_trigger_files and not worker_running)
         self.validate_button.setEnabled((input_valid or has_enabled_entries) and not worker_running)
-        self.inject_button.setEnabled(
-            input_valid
-            and output_valid
-            and has_enabled_entries
-            and (
-                (campaign_mode and selected_campaign_maps > 0 and self._campaign_context is not None)
-                or (not campaign_mode)
-            )
-            and not worker_running
-        )
+        self.inject_button.setEnabled(inject_ready)
         self.refresh_campaign_button.setEnabled(campaign_mode and input_valid and not worker_running)
         self.select_all_maps_button.setEnabled(campaign_mode and bool(self.campaign_map_table.entries()) and not worker_running)
         self.unselect_all_maps_button.setEnabled(campaign_mode and bool(self.campaign_map_table.entries()) and not worker_running)
         self.campaign_failure_combo.setEnabled(campaign_mode and not worker_running)
-        self.patch_mode_combo.setEnabled(not worker_running)
         self.save_preset_button.setEnabled(not worker_running)
         self.load_preset_button.setEnabled(not worker_running)
         self.reset_button.setEnabled(not worker_running)
@@ -1349,7 +1399,7 @@ class MainWindow(QMainWindow):
 
 
 class Worker(QObject):
-    """Background worker for scan/load/build tasks."""
+    """Background worker for scan/load/inject tasks."""
 
     progressChanged = Signal(str)
     logEmitted = Signal(str, str)
@@ -1447,7 +1497,7 @@ class Worker(QObject):
         )
 
     def _run_inject_build(self) -> None:
-        from services.injector import inject_and_build
+        from services.injector import inject_and_build, inject_and_build_campaign
 
         input_type = self.kwargs["input_type"] or detect_input_type(self.kwargs["input_path"])
         if input_type.is_map:
@@ -1460,19 +1510,17 @@ class Worker(QObject):
                 progress_callback=self.progressChanged.emit,
                 log_callback=self.logEmitted.emit,
             )
-            self.injectBuildCompleted.emit(result)
-            return
-
-        summary = inject_and_build_campaign(
-            campaign_context=self.kwargs["campaign_context"],
-            output_campaign=self.kwargs["output_path"],
-            selected_patch=self.kwargs["selection"],
-            selected_maps=self.kwargs["campaign_maps"],
-            options=self.kwargs["options"],
-            progress_callback=self.progressChanged.emit,
-            log_callback=self.logEmitted.emit,
-        )
-        self.injectBuildCompleted.emit(summary)
+        else:
+            result = inject_and_build_campaign(
+                campaign_context=self.kwargs["campaign_context"],
+                output_campaign=self.kwargs["output_path"],
+                selected_patch=self.kwargs["selection"],
+                selected_maps=self.kwargs["campaign_maps"],
+                options=self.kwargs["options"],
+                progress_callback=self.progressChanged.emit,
+                log_callback=self.logEmitted.emit,
+            )
+        self.injectBuildCompleted.emit(result)
 
 
 def _guess_global_name(text: str) -> str:

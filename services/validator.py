@@ -1,4 +1,4 @@
-"""Validation services for the trigger injector."""
+"""Validation services for the direct-replace trigger injector."""
 
 from __future__ import annotations
 
@@ -10,14 +10,19 @@ from models import (
     CampaignMapEntry,
     InputType,
     MapSourceContext,
-    MpqBackendType,
-    PatchMode,
     PatchConfig,
     PatchSelection,
     ValidationResult,
 )
 from mpq_handler import MpqHandler
 from services.input_detector import detect_input_type
+from services.patch_support import (
+    describe_backend,
+    format_patch_capabilities,
+    get_patch_capabilities,
+    resolve_patch_backend,
+    validate_patch_backend_support,
+)
 from utils import ensure_output_target_is_safe
 
 
@@ -42,21 +47,21 @@ def validate_map_source_text(source_text: str) -> list[str]:
 
 
 def validate_loaded_map_source(map_source: MapSourceContext) -> ValidationResult:
-    """Validate the extracted workspace and resolved script path for a loaded map."""
+    """Validate the extracted script workspace and resolved script path."""
     issues: list[str] = []
     warnings: list[str] = []
 
     if not map_source.extracted_dir.exists():
-        issues.append(f"Extracted workspace does not exist: {map_source.extracted_dir}")
+        issues.append(f"Temporary script workspace does not exist: {map_source.extracted_dir}")
         return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
     if not map_source.extracted_dir.is_dir():
-        issues.append(f"Extracted workspace is not a directory: {map_source.extracted_dir}")
+        issues.append(f"Temporary script workspace is not a directory: {map_source.extracted_dir}")
         return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
 
     script_relative = map_source.script_relative_path.as_posix()
     if not map_source.script_path.exists() or not map_source.script_path.is_file():
         issues.append(
-            f"Script not found: detected path '{script_relative}' is missing from the extracted workspace."
+            f"Script not found: detected path '{script_relative}' is missing from the temporary workspace."
         )
         return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
 
@@ -80,13 +85,15 @@ def validate_before_inject(
     output_map: Path | None,
     selected_patch: PatchSelection,
     overwrite: bool = False,
-    patch_mode: PatchMode = PatchMode.AUTO,
     map_source: MapSourceContext | None = None,
     source_text: str | None = None,
+    handler: MpqHandler | None = None,
+    patched_script_path: Path | None = None,
     campaign_maps: list[CampaignMapEntry] | None = None,
-    stop_on_first_error: bool = False,
+    log_callback=None,
 ) -> ValidationResult:
-    """Validate the current job before injection begins."""
+    """Validate the current direct-replace injection job."""
+    log = log_callback or (lambda _severity, _message: None)
     issues: list[str] = []
     warnings: list[str] = []
 
@@ -123,47 +130,77 @@ def validate_before_inject(
 
     issues.extend(_find_duplicate_issues(selected_patch))
 
-    if input_type is None:
-        return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
+    if input_type is InputType.CAMPAIGN_W3N:
+        if campaign_maps is None:
+            warnings.append("Load the campaign to scan embedded maps before patching.")
+        elif not campaign_maps:
+            issues.append("No embedded .w3x/.w3m maps were found in the selected campaign.")
+        else:
+            selected_entries = [entry for entry in campaign_maps if entry.selected]
+            if not selected_entries:
+                issues.append("Select at least one embedded campaign map before patching.")
+            unreadable_entries = [entry for entry in selected_entries if not entry.patchable]
+            for entry in unreadable_entries:
+                warnings.append(
+                    f"Embedded map is unreadable and cannot be patched yet: {entry.archive_path}. {entry.message}"
+                )
 
-    if input_type.is_map:
-        if map_source is not None:
-            loaded_validation = validate_loaded_map_source(map_source)
-            issues.extend(loaded_validation.issues)
-            warnings.extend(loaded_validation.warnings)
-            source_text = map_source.source_text
-            if source_text is not None:
-                warnings.extend(_effective_warnings(source_text, selected_patch))
-            fast_replace_validation = _validate_requested_fast_replace(
-                patch_mode=patch_mode,
-                input_map=input_map,
-                map_source=map_source,
-            )
-            issues.extend(fast_replace_validation.issues)
-            warnings.extend(fast_replace_validation.warnings)
-        elif source_text is not None:
-            issues.extend(validate_map_source_text(source_text))
-            warnings.extend(_effective_warnings(source_text, selected_patch))
-    else:
-        campaign_entries = campaign_maps or []
-        if not campaign_entries:
-            issues.append("Campaign scan results are required before campaign injection.")
-            return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
+    if map_source is not None:
+        loaded_validation = validate_loaded_map_source(map_source)
+        issues.extend(loaded_validation.issues)
+        warnings.extend(loaded_validation.warnings)
+        source_text = map_source.source_text
 
-        selected_entries = [entry for entry in campaign_entries if entry.selected]
-        if not selected_entries:
-            issues.append("At least one campaign map must be selected before injection.")
-        for entry in selected_entries:
-            if entry.patchable:
-                continue
-            if stop_on_first_error:
-                issues.append(
-                    f"Selected campaign map is unreadable or unpatchable: {entry.archive_path}. {entry.message}"
+        capabilities = None
+        try:
+            if handler is None:
+                handler, capabilities = resolve_patch_backend(
+                    external_listfiles=map_source.external_listfiles,
+                    log_callback=log,
                 )
             else:
-                warnings.append(
-                    f"Selected campaign map will be skipped if it fails: {entry.archive_path}. {entry.message}"
+                capabilities = get_patch_capabilities(handler)
+                log("INFO", f"Backend selected: {describe_backend(handler)}")
+                log("INFO", f"Backend capabilities: {format_patch_capabilities(capabilities)}")
+        except Exception as exc:
+            issues.append(str(exc))
+            handler = None
+            capabilities = None
+
+        if handler is not None and capabilities is not None:
+            backend_validation = validate_patch_backend_support(handler, capabilities)
+            log(
+                "INFO",
+                f"Validation patch capability result: {'pass' if backend_validation.is_valid else 'fail'}",
+            )
+            issues.extend(backend_validation.issues)
+            warnings.extend(backend_validation.warnings)
+
+        script_entry_path = map_source.script_relative_path.as_posix()
+        if not script_entry_path:
+            issues.append("Detected script path is required for direct replacement.")
+
+        if handler is not None and script_entry_path:
+            try:
+                archive_entries = set(
+                    handler.list_archive_entries_with_listfiles(
+                        map_source.input_path,
+                        external_listfiles=map_source.external_listfiles,
+                    )
                 )
+                if script_entry_path not in archive_entries:
+                    issues.append(
+                        f"Detected script entry was not found inside the archive: {script_entry_path}"
+                    )
+            except Exception as exc:
+                issues.append(str(exc))
+
+    if patched_script_path is not None and not patched_script_path.is_file():
+        issues.append(f"Patched script file was not generated successfully: {patched_script_path}")
+
+    if source_text is not None:
+        issues.extend(validate_map_source_text(source_text))
+        warnings.extend(_effective_warnings(source_text, selected_patch))
 
     return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
 
@@ -222,92 +259,3 @@ def _find_duplicate_issues(selected_patch: PatchSelection) -> list[str]:
         issues.append("Duplicate enabled main calls: " + ", ".join(sorted(calls_dupes)))
 
     return issues
-
-
-def validate_fast_replace_preconditions(
-    input_map: Path,
-    map_source: MapSourceContext,
-    patched_script_path: Path,
-    handler: MpqHandler,
-) -> ValidationResult:
-    """Validate the fast archive-replace workflow for one readable map."""
-    issues: list[str] = []
-    warnings: list[str] = []
-
-    if not input_map.is_file():
-        issues.append(f"Input archive path is required for fast replace: {input_map}")
-
-    if not handler.supports_fast_replace():
-        issues.append(
-            f"Backend '{handler.backend.name}' does not support fast replace "
-            "(requires list, delete, add, and replace entry operations)."
-        )
-        return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
-
-    script_entry_path = map_source.script_relative_path.as_posix()
-    if not script_entry_path:
-        issues.append("Fast replace requires a detected script path.")
-
-    if not patched_script_path.is_file():
-        issues.append(f"Patched script file does not exist: {patched_script_path}")
-
-    if issues:
-        return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
-
-    archive_entries = set(
-        handler.list_archive_entries_with_listfiles(
-            input_map,
-            external_listfiles=map_source.external_listfiles,
-        )
-    )
-    if script_entry_path not in archive_entries:
-        issues.append(
-            f"Detected script entry was not found inside the archive: {script_entry_path}"
-        )
-
-    return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
-
-
-def _validate_requested_fast_replace(
-    patch_mode: PatchMode,
-    input_map: Path | None,
-    map_source: MapSourceContext,
-) -> ValidationResult:
-    """Validate or warn about fast replace according to the selected patch mode."""
-    if input_map is None or not input_map.is_file():
-        return ValidationResult(is_valid=True, issues=[], warnings=[])
-
-    if patch_mode is PatchMode.FULL_REBUILD:
-        return ValidationResult(is_valid=True, issues=[], warnings=[])
-
-    try:
-        handler = MpqHandler.auto_detect(preferred_backend_type=MpqBackendType.MPQEDITOR)
-    except Exception as exc:
-        if patch_mode is PatchMode.FAST_REPLACE:
-            return ValidationResult(is_valid=False, issues=[str(exc)], warnings=[])
-        return ValidationResult(
-            is_valid=True,
-            issues=[],
-            warnings=[
-                f"Fast replace is unavailable with the current backend. Auto will use full rebuild. {exc}"
-            ],
-        )
-
-    validation = validate_fast_replace_preconditions(
-        input_map=input_map,
-        map_source=map_source,
-        patched_script_path=map_source.script_path,
-        handler=handler,
-    )
-    if patch_mode is PatchMode.FAST_REPLACE:
-        return validation
-    if validation.is_valid:
-        return ValidationResult(is_valid=True, issues=[], warnings=[])
-    return ValidationResult(
-        is_valid=True,
-        issues=[],
-        warnings=[
-            "Fast replace is unavailable for this map. Auto will use full rebuild. "
-            + " ".join(validation.issues)
-        ],
-    )

@@ -449,11 +449,11 @@ imported by:
  &#8226;   <a href="#models">models</a>
  &#8226;   <a href="#mpq_handler">mpq_handler</a>
  &#8226;   <a href="#patch_config">patch_config</a>
- &#8226;   <a href="#services.builder">services.builder</a>
  &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.trigger_parser">services.trigger_parser</a>
  &#8226;   <a href="#services.validator">services.validator</a>
  &#8226;   <a href="#shiboken6.Shiboken">shiboken6.Shiboken</a>
@@ -1992,7 +1992,7 @@ imported by:
     <a href="#models">models</a>
  &#8226;   <a href="#mpq_handler">mpq_handler</a>
  &#8226;   <a href="#pprint">pprint</a>
- &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#ui.campaign_widgets">ui.campaign_widgets</a>
  &#8226;   <a href="#ui.widgets">ui.widgets</a>
 
@@ -6332,11 +6332,11 @@ imported by:
     <a href="#jass_patcher">jass_patcher</a>
  &#8226;   <a href="#mpq_handler">mpq_handler</a>
  &#8226;   <a href="#patch_config">patch_config</a>
- &#8226;   <a href="#services.builder">services.builder</a>
  &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.trigger_parser">services.trigger_parser</a>
  &#8226;   <a href="#services.validator">services.validator</a>
  &#8226;   <a href="#ui.campaign_widgets">ui.campaign_widgets</a>
@@ -6366,10 +6366,8 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#services.builder">services.builder</a>
- &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
- &#8226;   <a href="#services.injector">services.injector</a>
- &#8226;   <a href="#services.map_loader">services.map_loader</a>
+    <a href="#services.campaign_loader">services.campaign_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.validator">services.validator</a>
 
   </div>
@@ -6630,11 +6628,11 @@ imported by:
  &#8226;   <a href="#patch_config">patch_config</a>
  &#8226;   <a href="#pathlib._abc">pathlib._abc</a>
  &#8226;   <a href="#pathlib._local">pathlib._local</a>
- &#8226;   <a href="#services.builder">services.builder</a>
  &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.trigger_parser">services.trigger_parser</a>
  &#8226;   <a href="#services.validator">services.validator</a>
  &#8226;   <a href="#ui.main_window">ui.main_window</a>
@@ -7152,34 +7150,13 @@ imported by:
   <a target="code" href="///D:/Python/toolwarcraft/services/__init__.py" type="text/plain"><tt>services</tt></a>
 <span class="moduletype">Package</span>  <div class="import">
 imported by:
-    <a href="#services.builder">services.builder</a>
- &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
+    <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.trigger_parser">services.trigger_parser</a>
  &#8226;   <a href="#services.validator">services.validator</a>
-
-  </div>
-
-</div>
-
-<div class="node">
-  <a name="services.builder"></a>
-  <a target="code" href="///D:/Python/toolwarcraft/services/builder.py" type="text/plain"><tt>services.builder</tt></a>
-<span class="moduletype">SourceModule</span>  <div class="import">
-imports:
-    <a href="#__future__">__future__</a>
- &#8226;   <a href="#models">models</a>
- &#8226;   <a href="#mpq_handler">mpq_handler</a>
- &#8226;   <a href="#pathlib">pathlib</a>
- &#8226;   <a href="#services">services</a>
-
-  </div>
-  <div class="import">
-imported by:
-    <a href="#services.campaign_loader">services.campaign_loader</a>
- &#8226;   <a href="#services.injector">services.injector</a>
 
   </div>
 
@@ -7195,18 +7172,15 @@ imports:
  &#8226;   <a href="#mpq_handler">mpq_handler</a>
  &#8226;   <a href="#pathlib">pathlib</a>
  &#8226;   <a href="#services">services</a>
- &#8226;   <a href="#services.builder">services.builder</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
- &#8226;   <a href="#shutil">shutil</a>
  &#8226;   <a href="#typing">typing</a>
  &#8226;   <a href="#utils">utils</a>
 
   </div>
   <div class="import">
 imported by:
-    <a href="#services.injector">services.injector</a>
- &#8226;   <a href="#ui.main_window">ui.main_window</a>
+    <a href="#ui.main_window">ui.main_window</a>
 
   </div>
 
@@ -7220,13 +7194,11 @@ imports:
     <a href="#__future__">__future__</a>
  &#8226;   <a href="#jass_patcher">jass_patcher</a>
  &#8226;   <a href="#models">models</a>
- &#8226;   <a href="#mpq_handler">mpq_handler</a>
  &#8226;   <a href="#pathlib">pathlib</a>
  &#8226;   <a href="#services">services</a>
- &#8226;   <a href="#services.builder">services.builder</a>
- &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.validator">services.validator</a>
  &#8226;   <a href="#shutil">shutil</a>
  &#8226;   <a href="#typing">typing</a>
@@ -7271,12 +7243,11 @@ imported by:
 <span class="moduletype">SourceModule</span>  <div class="import">
 imports:
     <a href="#__future__">__future__</a>
- &#8226;   <a href="#dataclasses">dataclasses</a>
  &#8226;   <a href="#models">models</a>
- &#8226;   <a href="#mpq_handler">mpq_handler</a>
  &#8226;   <a href="#pathlib">pathlib</a>
  &#8226;   <a href="#services">services</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#services.validator">services.validator</a>
  &#8226;   <a href="#typing">typing</a>
  &#8226;   <a href="#utils">utils</a>
@@ -7287,6 +7258,30 @@ imported by:
     <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#ui.main_window">ui.main_window</a>
+
+  </div>
+
+</div>
+
+<div class="node">
+  <a name="services.patch_support"></a>
+  <a target="code" href="///D:/Python/toolwarcraft/services/patch_support.py" type="text/plain"><tt>services.patch_support</tt></a>
+<span class="moduletype">SourceModule</span>  <div class="import">
+imports:
+    <a href="#__future__">__future__</a>
+ &#8226;   <a href="#dataclasses">dataclasses</a>
+ &#8226;   <a href="#models">models</a>
+ &#8226;   <a href="#mpq_handler">mpq_handler</a>
+ &#8226;   <a href="#pathlib">pathlib</a>
+ &#8226;   <a href="#services">services</a>
+ &#8226;   <a href="#typing">typing</a>
+
+  </div>
+  <div class="import">
+imported by:
+    <a href="#services.injector">services.injector</a>
+ &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.validator">services.validator</a>
 
   </div>
 
@@ -7326,6 +7321,7 @@ imports:
  &#8226;   <a href="#re">re</a>
  &#8226;   <a href="#services">services</a>
  &#8226;   <a href="#services.input_detector">services.input_detector</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#utils">utils</a>
 
   </div>
@@ -7428,7 +7424,6 @@ imports:
 imported by:
     <a href="#argparse">argparse</a>
  &#8226;   <a href="#mpq_handler">mpq_handler</a>
- &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#tarfile">tarfile</a>
  &#8226;   <a href="#tempfile">tempfile</a>
@@ -8087,6 +8082,7 @@ imported by:
  &#8226;   <a href="#services.campaign_loader">services.campaign_loader</a>
  &#8226;   <a href="#services.injector">services.injector</a>
  &#8226;   <a href="#services.map_loader">services.map_loader</a>
+ &#8226;   <a href="#services.patch_support">services.patch_support</a>
  &#8226;   <a href="#shiboken6">shiboken6</a>
 
   </div>

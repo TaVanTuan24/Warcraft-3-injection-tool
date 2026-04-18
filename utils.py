@@ -10,10 +10,13 @@ from pathlib import Path
 
 MANAGED_TEMP_PREFIXES: tuple[str, ...] = (
     "war3map_load_",
+    "war3map_script_",
     "war3campaign_load_",
     "war3campaign_map_build_",
     "mpq_list_",
     "mpq_extract_single_",
+    "mpq_add_",
+    "mpq_delete_",
 )
 
 
@@ -64,6 +67,46 @@ def create_temp_workspace(prefix: str, logger: logging.Logger) -> Path:
     workspace_root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
     logger.info("Created temp workspace: %s", workspace_root)
     return workspace_root
+
+
+class TempResourceTracker:
+    """Track tool-managed temp files and directories for guaranteed cleanup."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+        self._paths: list[tuple[Path, str]] = []
+
+    def create_temp_dir(self, prefix: str, label: str = "temp workspace") -> Path:
+        """Create and register a managed temporary directory."""
+        path = create_temp_workspace(prefix=prefix, logger=self._logger)
+        self.register_temp_dir(path, label=label)
+        return path
+
+    def register_temp_dir(self, path: Path, label: str = "temp workspace") -> Path:
+        """Register a managed temporary directory."""
+        return self._register_path(path, label=label)
+
+    def register_temp_file(self, path: Path, label: str = "temp file") -> Path:
+        """Register a managed temporary file."""
+        return self._register_path(path, label=label)
+
+    def cleanup_all(self, keep: bool = False) -> None:
+        """Clean up all tracked temp resources."""
+        if not self._paths:
+            self._logger.info("Temp cleanup complete.")
+            return
+
+        for path, label in reversed(self._paths):
+            cleanup_temp_path(path=path, keep=keep, logger=self._logger, label=label)
+        self._paths.clear()
+        self._logger.info("Temp cleanup complete.")
+
+    def _register_path(self, path: Path, label: str) -> Path:
+        resolved_path = path.expanduser().resolve()
+        if not is_managed_temp_path(resolved_path):
+            raise ValueError(f"Refusing to register unmanaged temp path: {resolved_path}")
+        self._paths.append((resolved_path, label))
+        return resolved_path
 
 
 def cleanup_workspace(workspace_root: Path, keep: bool, logger: logging.Logger) -> None:

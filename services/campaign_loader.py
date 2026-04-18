@@ -1,14 +1,12 @@
-"""Safe loading and rebuilding services for Warcraft 3 custom campaigns."""
+"""Campaign loading and embedded-map discovery services."""
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from typing import Sequence
 
 from models import CampaignContext, CampaignMapEntry, InputType, make_id
 from mpq_handler import MpqHandler
-from services.builder import build_campaign
 from services.input_detector import detect_input_type
 from services.map_loader import dispose_map_source, load_map_source
 from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace
@@ -31,14 +29,14 @@ def load_campaign_source(
             f"Unsupported campaign input type '{input_campaign.suffix}'. Only .w3n campaigns are supported."
         )
 
-    log("INFO", "Detecting MPQ backend.")
+    log("INFO", "Detected input type: campaign (.w3n)")
+    log("INFO", "Opening campaign archive.")
     handler = MpqHandler.auto_detect()
     workspace_root = create_temp_workspace("war3campaign_load_", logger=_TempLogger(log))
     extracted_dir = workspace_root / "campaign_contents"
     extracted_dir.mkdir(parents=True, exist_ok=True)
 
     progress("opening campaign")
-    log("INFO", f"Extracting campaign archive: {input_campaign}")
     try:
         handler.extract_archive(input_path=input_campaign, destination_dir=extracted_dir)
         if not any(extracted_dir.rglob("*")):
@@ -66,20 +64,21 @@ def list_campaign_maps(
     progress = progress_callback or (lambda _step: None)
     log = log_callback or (lambda _severity, _message: None)
 
-    progress("scanning campaign maps")
+    progress("scanning campaign contents")
+    log("INFO", "Scanning campaign contents.")
     map_paths = sorted(
         path
         for path in campaign_context.extracted_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in {".w3x", ".w3m"}
     )
-    log("INFO", f"Found {len(map_paths)} embedded map archive(s) in campaign.")
+    log("INFO", f"Found {len(map_paths)} embedded maps.")
 
     entries: list[CampaignMapEntry] = []
     for index, map_path in enumerate(map_paths, start=1):
         relative_path = map_path.relative_to(campaign_context.extracted_dir).as_posix()
         map_type = detect_input_type(map_path)
         progress(f"scanning map {index}/{len(map_paths)}")
-        log("INFO", f"Scanning campaign map {index}/{len(map_paths)}: {relative_path}")
+        log("INFO", f"Scanning embedded map {index}/{len(map_paths)}: {relative_path}")
         entry = CampaignMapEntry(
             id=make_id("campaign_map"),
             archive_path=relative_path,
@@ -110,45 +109,10 @@ def list_campaign_maps(
             dispose_map_source(map_context, keep=False, log_callback=log_callback)
         entries.append(entry)
 
+    if not entries:
+        log("WARNING", "No embedded .w3x/.w3m maps were found in the campaign.")
     campaign_context.map_entries = entries
     return entries
-
-
-def extract_campaign_map(
-    campaign_context: CampaignContext,
-    map_entry: CampaignMapEntry,
-    progress_callback=None,
-    log_callback=None,
-):
-    """Load one embedded campaign map into its own extracted map workspace."""
-    map_path = get_campaign_map_path(campaign_context, map_entry)
-    return load_map_source(
-        input_war3_archive=map_path,
-        external_listfiles=campaign_context.external_listfiles,
-        progress_callback=progress_callback,
-        log_callback=log_callback,
-    )
-
-
-def replace_campaign_map(
-    campaign_context: CampaignContext,
-    map_entry: CampaignMapEntry,
-    patched_map_path: Path,
-) -> None:
-    """Replace the extracted campaign copy of a map with a patched map archive."""
-    target_path = get_campaign_map_path(campaign_context, map_entry)
-    if not target_path.parent.exists():
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(patched_map_path, target_path)
-
-
-def build_campaign_archive(
-    campaign_context: CampaignContext,
-    output_path: Path,
-    log_callback=None,
-):
-    """Rebuild the extracted campaign workspace into a new campaign archive."""
-    return build_campaign(campaign_context.extracted_dir, output_path, log_callback=log_callback)
 
 
 def dispose_campaign_source(
@@ -159,11 +123,6 @@ def dispose_campaign_source(
     """Clean up an extracted campaign workspace."""
     log = log_callback or (lambda _severity, _message: None)
     cleanup_workspace(campaign_context.workspace_root, keep=keep, logger=_TempLogger(log))
-
-
-def get_campaign_map_path(campaign_context: CampaignContext, map_entry: CampaignMapEntry) -> Path:
-    """Resolve the extracted workspace path for an embedded campaign map."""
-    return (campaign_context.extracted_dir / Path(map_entry.archive_path)).resolve()
 
 
 class _TempLogger:

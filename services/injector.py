@@ -1,4 +1,4 @@
-"""Patch injection services."""
+"""Direct archive patch injection services."""
 
 from __future__ import annotations
 
@@ -9,27 +9,23 @@ from typing import Sequence
 from jass_patcher import get_effective_patch_config, patch_war3map_j
 from models import (
     CampaignBuildSummary,
+    CampaignContext,
     CampaignMapEntry,
     CampaignPatchResult,
     MapSourceContext,
-    MpqBackendType,
-    PatchMode,
     PatchConfig,
     PatchResult,
     PatchRunOptions,
     PatchSelection,
     PatchedSourceResult,
 )
-from mpq_handler import MpqHandler
-from services.builder import build_map
-from services.campaign_loader import (
-    build_campaign_archive,
-    extract_campaign_map,
-    replace_campaign_map,
-)
 from services.input_detector import detect_input_type
 from services.map_loader import dispose_map_source, load_map_source
-from services.validator import validate_before_inject, validate_fast_replace_preconditions
+from services.patch_support import (
+    resolve_patch_backend,
+    validate_patch_backend_support,
+)
+from services.validator import validate_before_inject
 from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace, ensure_output_target_is_safe
 
 
@@ -67,7 +63,7 @@ def inject_patch(
     map_source: MapSourceContext,
     selected_patch: PatchSelection,
 ) -> PatchedSourceResult:
-    """Inject enabled patch content into an extracted map source."""
+    """Inject enabled patch content into the temporary extracted script."""
     effective_selection = effective_selection_for_map(map_source.source_text, selected_patch)
     patch_result = patch_war3map_j(
         map_source.script_path,
@@ -91,29 +87,40 @@ def inject_and_build(
     progress_callback=None,
     log_callback=None,
 ) -> PatchResult:
-    """Full safe workflow for one readable map: load, validate, inject, rebuild, cleanup."""
+    """Load a map script, patch it, copy the input map, and replace the script entry."""
     progress = progress_callback or (lambda _step: None)
     log = log_callback or (lambda _severity, _message: None)
 
     input_type = detect_input_type(input_map)
     if not input_type.is_map:
-        raise ArchiveProcessingError("Single-map injection only supports .w3x and .w3m inputs.")
+        raise ArchiveProcessingError("Direct injection only supports .w3x and .w3m inputs.")
 
     ensure_output_target_is_safe(
         input_path=input_map,
         output_path=output_map,
         overwrite=options.overwrite,
     )
-    validation = validate_before_inject(
+    initial_validation = validate_before_inject(
         input_map=input_map,
         output_map=output_map,
         selected_patch=selected_patch,
         overwrite=options.overwrite,
-        patch_mode=options.patch_mode,
+        log_callback=log,
     )
-    if not validation.is_valid:
-        raise ValueError("\n".join(validation.issues))
+    if not initial_validation.is_valid:
+        raise ValueError("\n".join(initial_validation.issues))
 
+    handler, capabilities = resolve_patch_backend(
+        external_listfiles=external_listfiles,
+        log_callback=log,
+    )
+    backend_validation = validate_patch_backend_support(handler, capabilities)
+    log(
+        "INFO",
+        f"Inject patch capability result: {'pass' if backend_validation.is_valid else 'fail'}",
+    )
+    if not backend_validation.is_valid:
+        raise ValueError("\n".join(backend_validation.issues))
     map_source = load_map_source(
         input_war3_archive=input_map,
         external_listfiles=external_listfiles,
@@ -122,27 +129,45 @@ def inject_and_build(
     )
     try:
         progress("validating target map")
-        log("INFO", f"Using detected script: {map_source.script_relative_path.as_posix()}")
         validation = validate_before_inject(
             input_map=input_map,
             output_map=output_map,
             selected_patch=selected_patch,
             overwrite=options.overwrite,
-            patch_mode=options.patch_mode,
             map_source=map_source,
+            source_text=map_source.source_text,
+            handler=handler,
+            log_callback=log,
         )
         if not validation.is_valid:
             raise ValueError("\n".join(validation.issues))
         for warning in validation.warnings:
             log("WARNING", warning)
+
+        progress("patching script content")
+        log("INFO", "Patching script content.")
         patched_source = inject_patch(map_source, selected_patch)
-        log("INFO", f"Patch mode selected: {options.patch_mode.label}")
-        return _write_patched_map_archive(
+
+        validation = validate_before_inject(
+            input_map=input_map,
+            output_map=output_map,
+            selected_patch=selected_patch,
+            overwrite=options.overwrite,
+            map_source=map_source,
+            source_text=patched_source.patched_text,
+            handler=handler,
+            patched_script_path=map_source.script_path,
+            log_callback=log,
+        )
+        if not validation.is_valid:
+            raise ValueError("\n".join(validation.issues))
+
+        return _replace_script_entry(
             input_map=input_map,
             output_map=output_map,
             map_source=map_source,
             patched_source=patched_source,
-            options=options,
+            handler=handler,
             progress_callback=progress,
             log_callback=log,
         )
@@ -151,7 +176,7 @@ def inject_and_build(
 
 
 def inject_and_build_campaign(
-    campaign_context,
+    campaign_context: CampaignContext,
     output_campaign: Path,
     selected_patch: PatchSelection,
     selected_maps: list[CampaignMapEntry],
@@ -159,12 +184,9 @@ def inject_and_build_campaign(
     progress_callback=None,
     log_callback=None,
 ) -> CampaignBuildSummary:
-    """Patch selected readable campaign maps and rebuild a new .w3n archive."""
+    """Patch selected embedded maps and replace them back into a copied campaign archive."""
     progress = progress_callback or (lambda _step: None)
     log = log_callback or (lambda _severity, _message: None)
-
-    if options.patch_mode is PatchMode.FAST_REPLACE:
-        log("WARNING", "Campaign patching does not support fast replace. Using full rebuild.")
 
     ensure_output_target_is_safe(
         input_path=campaign_context.input_path,
@@ -176,21 +198,42 @@ def inject_and_build_campaign(
         output_map=output_campaign,
         selected_patch=selected_patch,
         overwrite=options.overwrite,
-        patch_mode=PatchMode.FULL_REBUILD,
-        campaign_maps=campaign_context.map_entries,
-        stop_on_first_error=options.stop_on_first_error,
+        campaign_maps=selected_maps,
+        log_callback=log,
     )
     if not validation.is_valid:
         raise ValueError("\n".join(validation.issues))
+    for warning in validation.warnings:
+        log("WARNING", warning)
+
+    handler, capabilities = resolve_patch_backend(
+        external_listfiles=campaign_context.external_listfiles,
+        log_callback=log,
+    )
+    backend_validation = validate_patch_backend_support(handler, capabilities)
+    log(
+        "INFO",
+        f"Inject patch capability result: {'pass' if backend_validation.is_valid else 'fail'}",
+    )
+    if not backend_validation.is_valid:
+        raise ValueError("\n".join(backend_validation.issues))
+
+    output_campaign.parent.mkdir(parents=True, exist_ok=True)
+    log("INFO", f"Copying input campaign to output campaign: {campaign_context.input_path} -> {output_campaign}")
+    shutil.copy2(campaign_context.input_path, output_campaign)
 
     selected_by_id = {entry.id: entry for entry in selected_maps}
-    per_map_results: list[CampaignPatchResult] = []
-    processed_successfully = 0
+    selected_entries = [entry for entry in selected_maps if entry.selected]
+    total_selected = len(selected_entries)
     total_maps = len(campaign_context.map_entries)
-    total_selected = len(selected_maps)
+    processed_selected = 0
+    succeeded_maps = 0
+    skipped_maps = 0
+    failed_maps = 0
+    per_map_results: list[CampaignPatchResult] = []
 
-    for map_index, map_entry in enumerate(campaign_context.map_entries, start=1):
-        current_entry = selected_by_id.get(map_entry.id, map_entry)
+    for original_entry in campaign_context.map_entries:
+        current_entry = selected_by_id.get(original_entry.id, original_entry)
         if not current_entry.selected:
             per_map_results.append(
                 CampaignPatchResult(
@@ -206,10 +249,11 @@ def inject_and_build_campaign(
             )
             continue
 
-        progress(f"processing map {map_index}/{total_maps}")
+        processed_selected += 1
+        progress(f"processing map {processed_selected}/{total_selected}")
         log(
             "INFO",
-            f"Processing campaign map {map_index}/{total_maps}: {current_entry.archive_path}",
+            f"Processing campaign map {processed_selected}/{total_selected}: {current_entry.archive_path}",
         )
 
         if not current_entry.patchable:
@@ -224,42 +268,67 @@ def inject_and_build_campaign(
                 message=current_entry.message or "Map is unreadable or unpatchable.",
             )
             per_map_results.append(result)
+            failed_maps += 1
+            log("ERROR", f"Campaign map failed: {current_entry.archive_path}. {result.message}")
             if options.stop_on_first_error:
                 raise ArchiveProcessingError(result.message)
-            log("ERROR", f"Skipping failed campaign map: {current_entry.archive_path}. {result.message}")
+            skipped_maps += 1
             continue
 
-        map_source = extract_campaign_map(
-            campaign_context,
-            current_entry,
-            progress_callback=progress,
-            log_callback=log,
-        )
-        try:
-            patched_source = inject_patch(map_source, selected_patch)
-            temp_output_root = create_temp_workspace(
-                "war3campaign_map_build_",
-                logger=_CallbackLogger(log),
+        embedded_map_path = campaign_context.extracted_dir / Path(current_entry.archive_path)
+        if not embedded_map_path.is_file():
+            message = f"Embedded map file not found in extracted campaign: {embedded_map_path}"
+            result = CampaignPatchResult(
+                map_entry_id=current_entry.id,
+                archive_path=current_entry.archive_path,
+                map_name=current_entry.map_name,
+                selected=True,
+                succeeded=False,
+                skipped=not options.stop_on_first_error,
+                failed=True,
+                message=message,
             )
-            temp_output = temp_output_root / current_entry.map_name
-            try:
-                log("INFO", f"Rebuilding embedded map: {current_entry.archive_path}")
-                build_map(map_source.extracted_dir, temp_output, log_callback=log)
-                log("INFO", f"Replacing embedded map in campaign: {current_entry.archive_path}")
-                replace_campaign_map(campaign_context, current_entry, temp_output)
-            finally:
-                cleanup_workspace(
-                    temp_output_root,
-                    keep=options.keep_temp,
-                    logger=_CallbackLogger(log),
-                )
+            per_map_results.append(result)
+            failed_maps += 1
+            log("ERROR", f"Campaign map failed: {current_entry.archive_path}. {message}")
+            if options.stop_on_first_error:
+                raise ArchiveProcessingError(message)
+            skipped_maps += 1
+            continue
 
-            duplicate_counts = _calculate_duplicate_counts(selected_patch, patched_source.effective_selection)
-            message = (
-                f"Patched successfully: globals={patched_source.patch_result.added_globals}, "
-                f"functions={patched_source.patch_result.added_functions}, "
-                f"main calls={patched_source.patch_result.added_init_calls}."
+        temp_output_root = create_temp_workspace(
+            "war3campaign_map_build_",
+            logger=_CallbackLogger(log),
+        )
+        temp_output_map = temp_output_root / current_entry.map_name
+        try:
+            patch_result = inject_and_build(
+                input_map=embedded_map_path,
+                output_map=temp_output_map,
+                selected_patch=selected_patch,
+                options=PatchRunOptions(
+                    overwrite=True,
+                    keep_temp=options.keep_temp,
+                    verbose=options.verbose,
+                    stop_on_first_error=options.stop_on_first_error,
+                ),
+                external_listfiles=campaign_context.external_listfiles,
+                progress_callback=lambda step, prefix=current_entry.archive_path: progress(
+                    f"{step} [{prefix}]"
+                ),
+                log_callback=log,
             )
+            log("INFO", f"Replacing embedded map in output campaign: {current_entry.archive_path}")
+            handler.replace_file_in_archive(
+                archive_path=output_campaign,
+                archive_entry_path=current_entry.archive_path,
+                local_file_path=temp_output_map,
+            )
+            message = (
+                f"Patched successfully (globals={patch_result.added_globals}, "
+                f"functions={patch_result.added_functions}, main calls={patch_result.added_init_calls})."
+            )
+            log("SUCCESS", f"Campaign map patched successfully: {current_entry.archive_path}. {message}")
             per_map_results.append(
                 CampaignPatchResult(
                     map_entry_id=current_entry.id,
@@ -269,16 +338,13 @@ def inject_and_build_campaign(
                     succeeded=True,
                     skipped=False,
                     failed=False,
-                    added_globals=patched_source.patch_result.added_globals,
-                    added_functions=patched_source.patch_result.added_functions,
-                    added_init_calls=patched_source.patch_result.added_init_calls,
-                    duplicate_globals_skipped=duplicate_counts[0],
-                    duplicate_functions_skipped=duplicate_counts[1],
-                    duplicate_main_calls_skipped=duplicate_counts[2],
+                    added_globals=patch_result.added_globals,
+                    added_functions=patch_result.added_functions,
+                    added_init_calls=patch_result.added_init_calls,
                     message=message,
                 )
             )
-            processed_successfully += 1
+            succeeded_maps += 1
         except Exception as exc:
             result = CampaignPatchResult(
                 map_entry_id=current_entry.id,
@@ -291,37 +357,38 @@ def inject_and_build_campaign(
                 message=str(exc),
             )
             per_map_results.append(result)
+            failed_maps += 1
+            log("ERROR", f"Campaign map failed: {current_entry.archive_path}. {exc}")
             if options.stop_on_first_error:
                 raise
-            log("ERROR", f"Failed campaign map {current_entry.archive_path}: {exc}")
+            skipped_maps += 1
         finally:
-            dispose_map_source(map_source, keep=False, log_callback=log)
+            cleanup_workspace(
+                temp_output_root,
+                keep=options.keep_temp,
+                logger=_CallbackLogger(log),
+            )
 
-    if processed_successfully == 0:
+    if succeeded_maps == 0:
         raise ArchiveProcessingError(
-            "No selected campaign maps could be processed successfully. No output campaign was built."
+            "No selected campaign maps were patched successfully. Output campaign was not produced."
         )
 
-    progress("rebuilding campaign")
-    log("INFO", f"Rebuilding campaign archive: {output_campaign}")
-    build_campaign_archive(campaign_context, output_campaign, log_callback=log)
-    progress("built")
-
-    summary = CampaignBuildSummary(
+    progress("inject completed")
+    log("SUCCESS", f"Campaign inject completed successfully: {output_campaign}")
+    return CampaignBuildSummary(
         output_path=output_campaign,
         total_maps_found=total_maps,
         selected_maps=total_selected,
-        succeeded_maps=sum(1 for result in per_map_results if result.succeeded),
-        skipped_maps=sum(1 for result in per_map_results if result.skipped),
-        failed_maps=sum(1 for result in per_map_results if result.failed),
+        succeeded_maps=succeeded_maps,
+        skipped_maps=skipped_maps,
+        failed_maps=failed_maps,
         per_map_results=per_map_results,
     )
-    log("SUCCESS", f"Built patched campaign: {output_campaign}")
-    return summary
 
 
 def summarize_campaign_build(summary: CampaignBuildSummary) -> str:
-    """Create a readable text summary for campaign patch/build results."""
+    """Create a readable summary for campaign patch results."""
     lines = [
         f"Patched campaign created: {summary.output_path}",
         f"Total maps found: {summary.total_maps_found}",
@@ -333,185 +400,52 @@ def summarize_campaign_build(summary: CampaignBuildSummary) -> str:
         "Per-map results:",
     ]
     for result in summary.per_map_results:
+        state = "success" if result.succeeded else "failed" if result.failed else "skipped"
         lines.append(
             (
-                f"- {result.archive_path}: "
-                f"{'success' if result.succeeded else 'failed' if result.failed else 'skipped'} | "
-                f"globals={result.added_globals}, functions={result.added_functions}, "
-                f"main calls={result.added_init_calls}, dupes skipped="
-                f"{result.duplicate_globals_skipped + result.duplicate_functions_skipped + result.duplicate_main_calls_skipped} | "
+                f"- {result.archive_path}: {state} | globals={result.added_globals}, "
+                f"functions={result.added_functions}, main calls={result.added_init_calls} | "
                 f"{result.message}"
             )
         )
     return "\n".join(lines)
 
 
-def _write_patched_map_archive(
+def _replace_script_entry(
     input_map: Path,
     output_map: Path,
     map_source: MapSourceContext,
     patched_source: PatchedSourceResult,
-    options: PatchRunOptions,
+    handler: MpqHandler,
     progress_callback=None,
     log_callback=None,
 ) -> PatchResult:
     progress = progress_callback or (lambda _step: None)
     log = log_callback or (lambda _severity, _message: None)
 
-    if options.patch_mode is PatchMode.FULL_REBUILD:
-        return _build_patched_map_archive(
-            output_map=output_map,
-            map_source=map_source,
-            patched_source=patched_source,
-            progress_callback=progress,
-            log_callback=log,
-        )
+    progress("copying input map to output map")
+    output_map.parent.mkdir(parents=True, exist_ok=True)
+    log("INFO", f"Copying input map to output map: {input_map} -> {output_map}")
+    shutil.copy2(input_map, output_map)
 
-    if options.patch_mode is PatchMode.FAST_REPLACE:
-        return _fast_replace_patched_map_archive(
-            input_map=input_map,
-            output_map=output_map,
-            map_source=map_source,
-            patched_source=patched_source,
-            progress_callback=progress,
-            log_callback=log,
-        )
+    script_entry_path = map_source.script_relative_path.as_posix()
+    progress("replacing script entry in archive")
+    log("INFO", f"Replacing script entry in archive: {script_entry_path}")
+    handler.replace_file_in_archive(
+        archive_path=output_map,
+        archive_entry_path=script_entry_path,
+        local_file_path=map_source.script_path,
+        external_listfiles=map_source.external_listfiles,
+    )
 
-    try:
-        return _fast_replace_patched_map_archive(
-            input_map=input_map,
-            output_map=output_map,
-            map_source=map_source,
-            patched_source=patched_source,
-            progress_callback=progress,
-            log_callback=log,
-        )
-    except Exception as exc:
-        log("WARNING", f"Fast replace failed, falling back to full rebuild. {exc}")
-        return _build_patched_map_archive(
-            output_map=output_map,
-            map_source=map_source,
-            patched_source=patched_source,
-            progress_callback=progress,
-            log_callback=log,
-        )
-
-
-def _build_patched_map_archive(
-    output_map: Path,
-    map_source: MapSourceContext,
-    patched_source: PatchedSourceResult,
-    progress_callback=None,
-    log_callback=None,
-) -> PatchResult:
-    progress = progress_callback or (lambda _step: None)
-    log = log_callback or (lambda _severity, _message: None)
-
-    progress("injecting globals")
-    progress("injecting functions")
-    progress("injecting main calls")
-    progress("rebuilding archive")
-    log("INFO", "Using full rebuild.")
-    build_map(map_source.extracted_dir, output_map, log_callback=log)
-    progress("built")
-    log("SUCCESS", f"Built patched archive: {output_map}")
+    progress("inject completed")
+    log("SUCCESS", "Inject completed successfully.")
     return PatchResult(
         added_globals=patched_source.patch_result.added_globals,
         added_functions=patched_source.patch_result.added_functions,
         added_init_calls=patched_source.patch_result.added_init_calls,
         output_path=output_map,
     )
-
-
-def _fast_replace_patched_map_archive(
-    input_map: Path,
-    output_map: Path,
-    map_source: MapSourceContext,
-    patched_source: PatchedSourceResult,
-    progress_callback=None,
-    log_callback=None,
-) -> PatchResult:
-    progress = progress_callback or (lambda _step: None)
-    log = log_callback or (lambda _severity, _message: None)
-
-    progress("validating fast replace")
-    log("INFO", "Using fast replace.")
-    handler = MpqHandler.auto_detect(preferred_backend_type=MpqBackendType.MPQEDITOR)
-    validation = validate_fast_replace_preconditions(
-        input_map=input_map,
-        map_source=map_source,
-        patched_script_path=map_source.script_path,
-        handler=handler,
-    )
-    if not validation.is_valid:
-        raise ArchiveProcessingError(" ".join(validation.issues))
-    for warning in validation.warnings:
-        log("WARNING", warning)
-
-    progress("copying output archive")
-    log("INFO", f"Copying input archive to output archive: {input_map} -> {output_map}")
-    target_archive, copied_to_temp = _prepare_fast_replace_output(
-        input_map=input_map,
-        output_map=output_map,
-        workspace_root=map_source.workspace_root,
-    )
-    succeeded = False
-    try:
-        script_entry_path = map_source.script_relative_path.as_posix()
-        progress("replacing script in archive")
-        log("INFO", f"Locating script entry: {script_entry_path}")
-        log("INFO", f"Replacing script entry in archive: {script_entry_path}")
-        handler.replace_file_in_archive_with_listfiles(
-            archive_path=target_archive,
-            archive_entry_path=script_entry_path,
-            local_file_path=map_source.script_path,
-            external_listfiles=map_source.external_listfiles,
-        )
-        if copied_to_temp:
-            shutil.copy2(target_archive, output_map)
-        succeeded = True
-        progress("built")
-        log("SUCCESS", f"Fast replace succeeded: {output_map}")
-        return PatchResult(
-            added_globals=patched_source.patch_result.added_globals,
-            added_functions=patched_source.patch_result.added_functions,
-            added_init_calls=patched_source.patch_result.added_init_calls,
-            output_path=output_map,
-        )
-    finally:
-        if copied_to_temp:
-            target_archive.unlink(missing_ok=True)
-        elif not succeeded and target_archive.exists():
-            target_archive.unlink(missing_ok=True)
-
-
-def _prepare_fast_replace_output(
-    input_map: Path,
-    output_map: Path,
-    workspace_root: Path,
-) -> tuple[Path, bool]:
-    output_map.parent.mkdir(parents=True, exist_ok=True)
-    if input_map.resolve() != output_map.resolve():
-        shutil.copy2(input_map, output_map)
-        return output_map, False
-
-    temp_output = workspace_root / f"__fast_replace_copy{output_map.suffix}"
-    shutil.copy2(input_map, temp_output)
-    return temp_output, True
-
-
-class _CallbackLogger:
-    def __init__(self, callback) -> None:
-        self._callback = callback
-
-    def info(self, message: str, *args: object) -> None:
-        self._callback("INFO", message % args if args else message)
-
-    def debug(self, message: str, *args: object) -> None:
-        self._callback("INFO", message % args if args else message)
-
-    def warning(self, message: str, *args: object) -> None:
-        self._callback("WARNING", message % args if args else message)
 
 
 def _calculate_duplicate_counts(
@@ -534,6 +468,20 @@ def _filter_globals(entries, kept_values: list[str]) -> list:
             remaining.remove(candidate)
             result.append(entry)
     return result
+
+
+class _CallbackLogger:
+    def __init__(self, callback) -> None:
+        self._callback = callback
+
+    def info(self, message: str, *args: object) -> None:
+        self._callback("INFO", message % args if args else message)
+
+    def debug(self, message: str, *args: object) -> None:
+        self._callback("INFO", message % args if args else message)
+
+    def warning(self, message: str, *args: object) -> None:
+        self._callback("WARNING", message % args if args else message)
 
 
 def _filter_functions(entries, kept_values: list[str]) -> list:

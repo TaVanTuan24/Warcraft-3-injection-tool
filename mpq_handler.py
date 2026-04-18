@@ -1,4 +1,4 @@
-"""Archive backend adapter for Warcraft 3 MPQ map extraction and rebuild."""
+"""Archive backend adapter for direct Warcraft 3 script replacement."""
 
 from __future__ import annotations
 
@@ -12,17 +12,21 @@ from typing import Sequence
 
 from app_paths import app_root, bundle_root
 from models import MpqBackendInfo, MpqBackendType
-from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace, to_archive_path
+from utils import ArchiveProcessingError, TempResourceTracker
 
 
 LOGGER = logging.getLogger(__name__)
 
-
 SUPPORTED_BACKEND_CANDIDATES: tuple[tuple[str, MpqBackendType, str], ...] = (
-    ("mpqcli", MpqBackendType.MPQCLI, "mpqcli"),
-    ("mpqcli.exe", MpqBackendType.MPQCLI, "mpqcli"),
     ("MPQEditor", MpqBackendType.MPQEDITOR, "MPQEditor"),
     ("MPQEditor.exe", MpqBackendType.MPQEDITOR, "MPQEditor"),
+    ("mpqcli", MpqBackendType.MPQCLI, "mpqcli"),
+    ("mpqcli.exe", MpqBackendType.MPQCLI, "mpqcli"),
+)
+
+KNOWN_SCRIPT_ENTRY_PATHS: tuple[str, ...] = (
+    "war3map.j",
+    "scripts/war3map.j",
 )
 
 
@@ -32,14 +36,6 @@ class BackendCommand:
 
     args: tuple[str, ...]
     cwd: Path | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ArchiveBuildEntry:
-    """One file that should be written into the rebuilt archive."""
-
-    source_path: Path
-    archive_path: str
 
 
 class BaseMpqBackendAdapter:
@@ -54,7 +50,6 @@ class BaseMpqBackendAdapter:
     supports_replace_entry = False
 
     def build_test_command(self, backend: MpqBackendInfo) -> BackendCommand:
-        """Return a lightweight command that validates backend execution."""
         raise NotImplementedError
 
     def build_extract_command(
@@ -63,17 +58,6 @@ class BaseMpqBackendAdapter:
         input_path: Path,
         destination_dir: Path,
     ) -> BackendCommand:
-        """Return the backend command used to extract a map archive."""
-        raise NotImplementedError
-
-    def build_rebuild_commands(
-        self,
-        backend: MpqBackendInfo,
-        source_dir: Path,
-        output_path: Path,
-        archive_entries: Sequence[ArchiveBuildEntry],
-    ) -> tuple[BackendCommand, ...]:
-        """Return the backend commands used to rebuild a map archive."""
         raise NotImplementedError
 
 
@@ -100,24 +84,6 @@ class MpqCliBackendAdapter(BaseMpqBackendAdapter):
                 str(destination_dir),
                 str(input_path),
             )
-        )
-
-    def build_rebuild_commands(
-        self,
-        backend: MpqBackendInfo,
-        source_dir: Path,
-        output_path: Path,
-        archive_entries: Sequence[ArchiveBuildEntry],
-    ) -> tuple[BackendCommand, ...]:
-        return (
-            BackendCommand(
-                args=(
-                    str(backend.executable),
-                    "create",
-                    str(source_dir),
-                    str(output_path),
-                )
-            ),
         )
 
 
@@ -152,54 +118,6 @@ class MpqEditorBackendAdapter(BaseMpqBackendAdapter):
             )
         )
 
-    def build_rebuild_commands(
-        self,
-        backend: MpqBackendInfo,
-        source_dir: Path,
-        output_path: Path,
-        archive_entries: Sequence[ArchiveBuildEntry],
-    ) -> tuple[BackendCommand, ...]:
-        commands: list[BackendCommand] = [
-            BackendCommand(args=(str(backend.executable), "new", str(output_path))),
-            BackendCommand(
-                args=(
-                    str(backend.executable),
-                    "add",
-                    str(output_path),
-                    "*",
-                    ".",
-                    "/auto",
-                    "/r",
-                ),
-                cwd=source_dir,
-            ),
-        ]
-
-        rename_candidates = [
-            entry
-            for entry in archive_entries
-            if not entry.archive_path.startswith("(")
-        ]
-        chunk_size = 500
-        for index in range(0, len(rename_candidates), chunk_size):
-            chunk = rename_candidates[index:index + chunk_size]
-            script_path = source_dir.parent / f"__mpqeditor_rebuild_rename_{index // chunk_size:03d}.txt"
-            script_lines = []
-            for entry in chunk:
-                mpqeditor_path = _to_mpqeditor_archive_path(entry.archive_path)
-                script_lines.append(
-                    f'rename "{output_path}" ".\\{mpqeditor_path}" "{mpqeditor_path}"'
-                )
-            script_lines.extend(["close", "exit"])
-            script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
-            commands.append(
-                BackendCommand(
-                    args=(str(backend.executable), "/console", str(script_path))
-                )
-            )
-
-        return tuple(commands)
-
 
 BACKEND_ADAPTERS: dict[MpqBackendType, BaseMpqBackendAdapter] = {
     MpqBackendType.MPQCLI: MpqCliBackendAdapter(),
@@ -208,7 +126,7 @@ BACKEND_ADAPTERS: dict[MpqBackendType, BaseMpqBackendAdapter] = {
 
 
 class MpqHandler:
-    """Safe adapter around an external MPQ CLI backend."""
+    """Safe adapter around an external MPQ backend."""
 
     def __init__(self, backend: MpqBackendInfo) -> None:
         self.backend = backend
@@ -258,22 +176,20 @@ class MpqHandler:
 
         searched = ", ".join(searched_names)
         message = (
-            f"No supported MPQ backend found or validated on PATH. Searched executable names: "
-            f"{searched}."
+            "No supported MPQ backend found or validated on PATH. "
+            f"Searched executable names: {searched}."
         )
         if detection_failures:
             message = f"{message} Detected candidates failed validation: {'; '.join(detection_failures)}"
         else:
             message = (
                 f"{message} Install a supported backend and ensure one of those executable names "
-                f"is available on PATH."
+                "is available on PATH."
             )
-
         raise ArchiveProcessingError(message)
 
     @staticmethod
     def _resolve_backend_executable(executable_name: str) -> str | None:
-        """Resolve a backend executable from the app folder, bundle, or PATH."""
         search_roots: list[Path] = []
         for root in (app_root(), bundle_root()):
             if root not in search_roots:
@@ -287,7 +203,6 @@ class MpqHandler:
         return shutil.which(executable_name)
 
     def test_backend(self) -> None:
-        """Verify that the selected backend executable launches successfully."""
         test_command = self._adapter.build_test_command(self.backend)
         self._run_backend_command(
             command=test_command,
@@ -326,64 +241,42 @@ class MpqHandler:
                 destination_dir=destination_dir,
             )
 
-        error_context = (
-            "Failed to extract the map archive. The map may be unreadable, unsupported, or protected."
-        )
         self._run_backend_command(
             command=command,
-            error_context=error_context,
+            error_context=(
+                "Failed to extract the map archive. The map may be unreadable, unsupported, or protected."
+            ),
         )
         if not any(destination_dir.iterdir()):
             raise ArchiveProcessingError(
-                "Archive extraction produced no files. The archive may be unreadable, "
-                "unsupported, or protected."
+                "Archive extraction produced no files. The archive may be unreadable, unsupported, or protected."
             )
 
-    def extract_map(
-        self,
-        input_path: Path,
-        destination_dir: Path,
-        external_listfiles: Sequence[Path] | None = None,
-    ) -> None:
-        """Backwards-compatible wrapper for map extraction."""
-        self.extract_archive(
-            input_path=input_path,
-            destination_dir=destination_dir,
-            external_listfiles=external_listfiles,
-        )
-
     def supports_list_entries(self) -> bool:
-        """Return whether the backend can enumerate archive entries."""
         return bool(self._adapter.supports_list_entries)
 
     def supports_extract_single_file(self) -> bool:
-        """Return whether the backend can extract a single archive entry."""
         return bool(self._adapter.supports_extract_single_file)
 
     def supports_delete_entry(self) -> bool:
-        """Return whether the backend can delete a single archive entry."""
         return bool(self._adapter.supports_delete_entry)
 
     def supports_add_entry(self) -> bool:
-        """Return whether the backend can add a single archive entry."""
         return bool(self._adapter.supports_add_entry)
 
     def supports_replace_entry(self) -> bool:
-        """Return whether the backend can replace a single archive entry."""
         return bool(self._adapter.supports_replace_entry)
 
-    def supports_fast_replace(self) -> bool:
-        """Return whether the backend supports the fast script-replace workflow."""
+    def supports_direct_script_replace(self) -> bool:
+        return self.can_patch_archive()
+
+    def can_patch_archive(self) -> bool:
         return (
             self.supports_list_entries()
+            and self.supports_extract_single_file()
             and self.supports_delete_entry()
             and self.supports_add_entry()
-            and self.supports_replace_entry()
         )
-
-    def list_archive_entries(self, archive_path: Path) -> tuple[str, ...]:
-        """List normalized archive entry paths."""
-        return self.list_archive_entries_with_listfiles(archive_path, external_listfiles=None)
 
     def list_archive_entries_with_listfiles(
         self,
@@ -396,61 +289,88 @@ class MpqHandler:
             raise ArchiveProcessingError(
                 f"Backend '{self.backend.name}' does not support archive entry listing."
             )
+
         resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
+        if self.backend.backend_type is not MpqBackendType.MPQEDITOR:
+            raise ArchiveProcessingError(
+                f"Archive entry listing is not implemented for backend '{self.backend.name}'."
+            )
 
-        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
-            temp_dir = create_temp_workspace("mpq_list_", logger=LOGGER)
-            output_path = temp_dir / "entries.txt"
-            try:
-                if resolved_listfiles:
-                    command = self._build_mpqeditor_console_command(
-                        archive_path=archive_path,
-                        script_lines=[
-                            f'list "{archive_path}" "*" "{output_path}"',
-                        ],
-                        temp_dir=temp_dir,
-                        external_listfiles=resolved_listfiles,
-                        script_name="__mpqeditor_list_script.txt",
-                    )
-                else:
-                    command = BackendCommand(
-                        args=(
-                            str(self.backend.executable),
-                            "list",
-                            str(archive_path),
-                            "*",
-                            str(output_path),
-                        )
-                    )
-                self._run_backend_command(
-                    command=command,
-                    error_context="Failed to list archive entries.",
+        tracker = TempResourceTracker(LOGGER)
+        temp_dir = tracker.create_temp_dir("mpq_list_")
+        output_path = temp_dir / "entries.txt"
+        try:
+            if resolved_listfiles:
+                command = self._build_mpqeditor_console_command(
+                    archive_path=archive_path,
+                    script_lines=[f'list "{archive_path}" "*" "{output_path}"'],
+                    temp_dir=temp_dir,
+                    external_listfiles=resolved_listfiles,
+                    script_name="__mpqeditor_list_script.txt",
                 )
-                if not output_path.is_file():
-                    raise ArchiveProcessingError(
-                        f"Backend did not produce an archive listing for {archive_path}."
+            else:
+                command = BackendCommand(
+                    args=(
+                        str(self.backend.executable),
+                        "list",
+                        str(archive_path),
+                        "*",
+                        str(output_path),
                     )
-                entries = []
-                for raw_line in output_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                ).splitlines():
-                    entry = _normalize_archive_entry_path(raw_line)
-                    if entry:
-                        entries.append(entry)
-                return tuple(entries)
-            finally:
-                cleanup_workspace(temp_dir, keep=False, logger=LOGGER)
+                )
+            self._run_backend_command(
+                command=command,
+                error_context="Failed to list archive entries.",
+            )
+            if not output_path.is_file():
+                raise ArchiveProcessingError(
+                    f"Backend did not produce an archive listing for {archive_path}."
+                )
+            entries = []
+            for raw_line in output_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines():
+                entry = _normalize_archive_entry_path(raw_line)
+                if entry:
+                    entries.append(entry)
+            return tuple(entries)
+        finally:
+            tracker.cleanup_all(keep=False)
 
-        raise ArchiveProcessingError(
-            f"Archive entry listing is not implemented for backend '{self.backend.name}'."
+    def get_script_entry_path(
+        self,
+        archive_path: Path,
+        external_listfiles: Sequence[Path] | None = None,
+    ) -> str:
+        """Locate the target script entry path inside an archive."""
+        entries = self.list_archive_entries_with_listfiles(
+            archive_path=archive_path,
+            external_listfiles=external_listfiles,
         )
+        normalized_entries = {_normalize_archive_entry_path(entry): entry for entry in entries}
 
-    def extract_file_from_archive(
+        for candidate in KNOWN_SCRIPT_ENTRY_PATHS:
+            if candidate in normalized_entries:
+                return candidate
+
+        recursive_matches = sorted(
+            entry
+            for entry in normalized_entries
+            if Path(entry).name.lower() == "war3map.j"
+        )
+        if not recursive_matches:
+            raise ArchiveProcessingError(
+                "Script not found: could not locate 'war3map.j' inside the archive."
+            )
+        return recursive_matches[0]
+
+    def extract_file_from_archive_with_listfiles(
         self,
         archive_path: Path,
         archive_entry_path: str,
         output_path: Path,
+        external_listfiles: Sequence[Path] | None = None,
     ) -> None:
         """Extract one archive entry into a local file path."""
         self._validate_input_archive_path(archive_path)
@@ -463,9 +383,26 @@ class MpqHandler:
         if not normalized_entry:
             raise ArchiveProcessingError("Archive entry path is required for single-file extraction.")
 
-        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
-            temp_dir = create_temp_workspace("mpq_extract_single_", logger=LOGGER)
-            try:
+        resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
+        if self.backend.backend_type is not MpqBackendType.MPQEDITOR:
+            raise ArchiveProcessingError(
+                f"Single-file extraction is not implemented for backend '{self.backend.name}'."
+            )
+
+        tracker = TempResourceTracker(LOGGER)
+        temp_dir = tracker.create_temp_dir("mpq_extract_single_")
+        try:
+            if resolved_listfiles:
+                command = self._build_mpqeditor_console_command(
+                    archive_path=archive_path,
+                    script_lines=[
+                        f'extract "{archive_path}" "{_to_mpqeditor_archive_path(normalized_entry)}" "{temp_dir}" /fp'
+                    ],
+                    temp_dir=temp_dir,
+                    external_listfiles=resolved_listfiles,
+                    script_name="__mpqeditor_extract_single_script.txt",
+                )
+            else:
                 command = BackendCommand(
                     args=(
                         str(self.backend.executable),
@@ -476,32 +413,19 @@ class MpqHandler:
                         "/fp",
                     )
                 )
-                self._run_backend_command(
-                    command=command,
-                    error_context="Failed to extract the requested archive entry.",
+            self._run_backend_command(
+                command=command,
+                error_context="Failed to extract the requested archive entry.",
+            )
+            extracted_path = temp_dir / Path(normalized_entry)
+            if not extracted_path.is_file():
+                raise ArchiveProcessingError(
+                    f"Backend did not extract the requested archive entry: {normalized_entry}"
                 )
-                extracted_path = temp_dir / Path(normalized_entry)
-                if not extracted_path.is_file():
-                    raise ArchiveProcessingError(
-                        f"Backend did not extract the requested archive entry: {normalized_entry}"
-                    )
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(extracted_path, output_path)
-                return
-            finally:
-                cleanup_workspace(temp_dir, keep=False, logger=LOGGER)
-
-        raise ArchiveProcessingError(
-            f"Single-file extraction is not implemented for backend '{self.backend.name}'."
-        )
-
-    def delete_file_in_archive(self, archive_path: Path, archive_entry_path: str) -> None:
-        """Delete one entry from an archive."""
-        self.delete_file_in_archive_with_listfiles(
-            archive_path=archive_path,
-            archive_entry_path=archive_entry_path,
-            external_listfiles=None,
-        )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(extracted_path, output_path)
+        finally:
+            tracker.cleanup_all(keep=False)
 
     def delete_file_in_archive_with_listfiles(
         self,
@@ -515,62 +439,49 @@ class MpqHandler:
             raise ArchiveProcessingError(
                 f"Backend '{self.backend.name}' does not support deleting archive entries."
             )
-        resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
 
         normalized_entry = _normalize_archive_entry_path(archive_entry_path)
         if not normalized_entry:
             raise ArchiveProcessingError("Archive entry path is required for delete.")
 
-        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
-            if resolved_listfiles:
-                temp_dir = create_temp_workspace("mpq_list_", logger=LOGGER)
-                try:
-                    command = self._build_mpqeditor_console_command(
-                        archive_path=archive_path,
-                        script_lines=[
-                            f'delete "{archive_path}" "{_to_mpqeditor_archive_path(normalized_entry)}"',
-                        ],
-                        temp_dir=temp_dir,
-                        external_listfiles=resolved_listfiles,
-                        script_name="__mpqeditor_delete_script.txt",
-                    )
-                    self._run_backend_command(
-                        command=command,
-                        error_context=f"Failed to delete archive entry '{normalized_entry}'.",
-                    )
-                    return
-                finally:
-                    cleanup_workspace(temp_dir, keep=False, logger=LOGGER)
-            command = BackendCommand(
-                args=(
-                    str(self.backend.executable),
-                    "delete",
-                    str(archive_path),
-                    _to_mpqeditor_archive_path(normalized_entry),
+        resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
+        if self.backend.backend_type is not MpqBackendType.MPQEDITOR:
+            raise ArchiveProcessingError(
+                f"Archive entry deletion is not implemented for backend '{self.backend.name}'."
+            )
+
+        if resolved_listfiles:
+            tracker = TempResourceTracker(LOGGER)
+            temp_dir = tracker.create_temp_dir("mpq_delete_")
+            try:
+                command = self._build_mpqeditor_console_command(
+                    archive_path=archive_path,
+                    script_lines=[
+                        f'delete "{archive_path}" "{_to_mpqeditor_archive_path(normalized_entry)}"'
+                    ],
+                    temp_dir=temp_dir,
+                    external_listfiles=resolved_listfiles,
+                    script_name="__mpqeditor_delete_script.txt",
                 )
-            )
-            self._run_backend_command(
-                command=command,
-                error_context=f"Failed to delete archive entry '{normalized_entry}'.",
-            )
-            return
+                self._run_backend_command(
+                    command=command,
+                    error_context=f"Failed to delete archive entry '{normalized_entry}'.",
+                )
+                return
+            finally:
+                tracker.cleanup_all(keep=False)
 
-        raise ArchiveProcessingError(
-            f"Archive entry deletion is not implemented for backend '{self.backend.name}'."
+        command = BackendCommand(
+            args=(
+                str(self.backend.executable),
+                "delete",
+                str(archive_path),
+                _to_mpqeditor_archive_path(normalized_entry),
+            )
         )
-
-    def add_file_to_archive(
-        self,
-        archive_path: Path,
-        archive_entry_path: str,
-        local_file_path: Path,
-    ) -> None:
-        """Add one local file into an archive entry path."""
-        self.add_file_to_archive_with_listfiles(
-            archive_path=archive_path,
-            archive_entry_path=archive_entry_path,
-            local_file_path=local_file_path,
-            external_listfiles=None,
+        self._run_backend_command(
+            command=command,
+            error_context=f"Failed to delete archive entry '{normalized_entry}'.",
         )
 
     def add_file_to_archive_with_listfiles(
@@ -588,49 +499,50 @@ class MpqHandler:
             )
         if not local_file_path.is_file():
             raise ArchiveProcessingError(f"Local file for archive add was not found: {local_file_path}")
-        resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
 
         normalized_entry = _normalize_archive_entry_path(archive_entry_path)
         if not normalized_entry:
             raise ArchiveProcessingError("Archive entry path is required for add.")
 
-        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
-            if resolved_listfiles:
-                temp_dir = create_temp_workspace("mpq_list_", logger=LOGGER)
-                try:
-                    command = self._build_mpqeditor_console_command(
-                        archive_path=archive_path,
-                        script_lines=[
-                            f'add "{archive_path}" "{local_file_path}" "{_to_mpqeditor_archive_path(normalized_entry)}"',
-                        ],
-                        temp_dir=temp_dir,
-                        external_listfiles=resolved_listfiles,
-                        script_name="__mpqeditor_add_script.txt",
-                    )
-                    self._run_backend_command(
-                        command=command,
-                        error_context=f"Failed to add archive entry '{normalized_entry}'.",
-                    )
-                    return
-                finally:
-                    cleanup_workspace(temp_dir, keep=False, logger=LOGGER)
-            command = BackendCommand(
-                args=(
-                    str(self.backend.executable),
-                    "add",
-                    str(archive_path),
-                    str(local_file_path),
-                    _to_mpqeditor_archive_path(normalized_entry),
-                )
+        resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
+        if self.backend.backend_type is not MpqBackendType.MPQEDITOR:
+            raise ArchiveProcessingError(
+                f"Archive entry add is not implemented for backend '{self.backend.name}'."
             )
-            self._run_backend_command(
-                command=command,
-                error_context=f"Failed to add archive entry '{normalized_entry}'.",
-            )
-            return
 
-        raise ArchiveProcessingError(
-            f"Archive entry add is not implemented for backend '{self.backend.name}'."
+        if resolved_listfiles:
+            tracker = TempResourceTracker(LOGGER)
+            temp_dir = tracker.create_temp_dir("mpq_add_")
+            try:
+                command = self._build_mpqeditor_console_command(
+                    archive_path=archive_path,
+                    script_lines=[
+                        f'add "{archive_path}" "{local_file_path}" "{_to_mpqeditor_archive_path(normalized_entry)}"'
+                    ],
+                    temp_dir=temp_dir,
+                    external_listfiles=resolved_listfiles,
+                    script_name="__mpqeditor_add_script.txt",
+                )
+                self._run_backend_command(
+                    command=command,
+                    error_context=f"Failed to add archive entry '{normalized_entry}'.",
+                )
+                return
+            finally:
+                tracker.cleanup_all(keep=False)
+
+        command = BackendCommand(
+            args=(
+                str(self.backend.executable),
+                "add",
+                str(archive_path),
+                str(local_file_path),
+                _to_mpqeditor_archive_path(normalized_entry),
+            )
+        )
+        self._run_backend_command(
+            command=command,
+            error_context=f"Failed to add archive entry '{normalized_entry}'.",
         )
 
     def replace_file_in_archive(
@@ -638,116 +550,54 @@ class MpqHandler:
         archive_path: Path,
         archive_entry_path: str,
         local_file_path: Path,
-    ) -> None:
-        """Replace one archive entry with a local file."""
-        self.replace_file_in_archive_with_listfiles(
-            archive_path=archive_path,
-            archive_entry_path=archive_entry_path,
-            local_file_path=local_file_path,
-            external_listfiles=None,
-        )
-
-    def replace_file_in_archive_with_listfiles(
-        self,
-        archive_path: Path,
-        archive_entry_path: str,
-        local_file_path: Path,
         external_listfiles: Sequence[Path] | None = None,
     ) -> None:
-        """Replace one archive entry with a local file, optionally using external listfiles."""
+        """Replace one archive entry with a local file."""
         self._validate_input_archive_path(archive_path)
-        if not self.supports_replace_entry():
+        if not self.can_patch_archive():
             raise ArchiveProcessingError(
-                f"Backend '{self.backend.name}' does not support replacing archive entries."
+                f"Backend '{self.backend.name}' does not support effective archive replacement."
             )
         if not local_file_path.is_file():
-            raise ArchiveProcessingError(
-                f"Patched script file does not exist: {local_file_path}"
-            )
+            raise ArchiveProcessingError(f"Patched script file does not exist: {local_file_path}")
 
         resolved_listfiles = self._resolve_external_listfiles(external_listfiles)
         normalized_entry = _normalize_archive_entry_path(archive_entry_path)
         entries = set(
             self.list_archive_entries_with_listfiles(
-                archive_path,
+                archive_path=archive_path,
                 external_listfiles=resolved_listfiles,
             )
         )
         if normalized_entry not in entries:
             raise ArchiveProcessingError(
-                f"Archive entry not found for fast replace: {normalized_entry}"
+                f"Archive entry not found for direct replace: {normalized_entry}"
             )
 
         self.delete_file_in_archive_with_listfiles(
-            archive_path,
-            normalized_entry,
+            archive_path=archive_path,
+            archive_entry_path=normalized_entry,
             external_listfiles=resolved_listfiles,
         )
         self.add_file_to_archive_with_listfiles(
-            archive_path,
-            normalized_entry,
-            local_file_path,
+            archive_path=archive_path,
+            archive_entry_path=normalized_entry,
+            local_file_path=local_file_path,
             external_listfiles=resolved_listfiles,
         )
 
         updated_entries = set(
             self.list_archive_entries_with_listfiles(
-                archive_path,
+                archive_path=archive_path,
                 external_listfiles=resolved_listfiles,
             )
         )
         if normalized_entry not in updated_entries:
             raise ArchiveProcessingError(
-                f"Fast replace did not restore the expected archive entry: {normalized_entry}"
+                f"Direct replace did not restore the expected archive entry: {normalized_entry}"
             )
-
-    def rebuild_archive(self, source_dir: Path, output_path: Path, log_callback=None) -> None:
-        """Rebuild a supported Warcraft 3 archive from an extracted directory."""
-        log = log_callback or (lambda _severity, _message: None)
-        if not source_dir.is_dir():
-            raise ArchiveProcessingError(
-                f"Cannot rebuild archive: source directory does not exist: {source_dir}"
-            )
-
-        archive_entries = self._collect_archive_entries(source_dir, log)
-        if not archive_entries:
-            raise ArchiveProcessingError(
-                f"Cannot rebuild archive: no valid files were found under {source_dir}"
-            )
-        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
-            rename_candidates = len(
-                [entry for entry in archive_entries if not entry.archive_path.startswith("(")]
-            )
-            log(
-                "INFO",
-                f"MPQEditor rebuild will normalize {rename_candidates} archive path(s) after import.",
-            )
-
-        commands = self._adapter.build_rebuild_commands(
-            backend=self.backend,
-            source_dir=source_dir,
-            output_path=output_path,
-            archive_entries=archive_entries,
-        )
-        self._run_backend_commands(
-            commands=commands,
-            error_context="Failed to rebuild the patched map archive.",
-        )
-        if not output_path.is_file():
-            raise ArchiveProcessingError(
-                f"MPQ backend completed without creating the expected output file: {output_path}"
-            )
-
-    def rebuild_map(self, source_dir: Path, output_path: Path, log_callback=None) -> None:
-        """Backwards-compatible wrapper for map rebuild."""
-        self.rebuild_archive(
-            source_dir=source_dir,
-            output_path=output_path,
-            log_callback=log_callback,
-        )
 
     def _validate_input_archive_path(self, input_path: Path) -> None:
-        """Validate the input archive path."""
         if not input_path.is_file():
             raise FileNotFoundError(f"Input file not found: {input_path}")
         if input_path.suffix.lower() not in {".w3x", ".w3m", ".w3n"}:
@@ -759,7 +609,6 @@ class MpqHandler:
         self,
         external_listfiles: Sequence[Path] | None,
     ) -> tuple[Path, ...]:
-        """Validate and normalize any user-supplied MPQ listfiles."""
         if not external_listfiles:
             return ()
 
@@ -781,7 +630,6 @@ class MpqHandler:
         destination_dir: Path,
         external_listfiles: Sequence[Path],
     ) -> BackendCommand:
-        """Build an MPQEditor console script that opens the archive with merged listfiles."""
         combined_listfile = destination_dir.parent / "__external_listfile__.txt"
         merged_entries = self._merge_listfile_entries(external_listfiles)
         if not merged_entries:
@@ -798,9 +646,7 @@ class MpqHandler:
             "exit",
         ]
         script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
-        return BackendCommand(
-            args=(str(self.backend.executable), "/console", str(script_path))
-        )
+        return BackendCommand(args=(str(self.backend.executable), "/console", str(script_path)))
 
     def _build_mpqeditor_console_command(
         self,
@@ -810,7 +656,6 @@ class MpqHandler:
         external_listfiles: Sequence[Path],
         script_name: str,
     ) -> BackendCommand:
-        """Build an MPQEditor console script that opens an archive with merged listfiles."""
         combined_listfile = temp_dir / "__external_listfile__.txt"
         merged_entries = self._merge_listfile_entries(external_listfiles)
         if not merged_entries:
@@ -824,12 +669,9 @@ class MpqHandler:
         full_script_lines.extend(script_lines)
         full_script_lines.extend([f'close "{archive_path}"', "exit"])
         script_path.write_text("\n".join(full_script_lines) + "\n", encoding="utf-8")
-        return BackendCommand(
-            args=(str(self.backend.executable), "/console", str(script_path))
-        )
+        return BackendCommand(args=(str(self.backend.executable), "/console", str(script_path)))
 
     def _merge_listfile_entries(self, external_listfiles: Sequence[Path]) -> list[str]:
-        """Merge multiple listfiles into one de-duplicated file for MPQEditor."""
         merged_entries: list[str] = []
         seen_entries: set[str] = set()
         for listfile_path in external_listfiles:
@@ -845,44 +687,11 @@ class MpqHandler:
                 merged_entries.append(entry)
         return merged_entries
 
-    def _collect_archive_entries(
-        self,
-        source_dir: Path,
-        log_callback,
-    ) -> tuple[ArchiveBuildEntry, ...]:
-        """Build a normalized archive file manifest from a workspace root."""
-        log_callback("INFO", f"Rebuild workspace root: {source_dir}")
-
-        entries: list[ArchiveBuildEntry] = []
-        for source_path in sorted(path.resolve() for path in source_dir.rglob("*") if path.is_file()):
-            try:
-                archive_path = to_archive_path(source_path, source_dir)
-            except ValueError as exc:
-                log_callback("WARNING", f"Skipped invalid archive entry: {exc}")
-                continue
-
-            log_callback("DEBUG", f"Source file: {source_path}")
-            log_callback("DEBUG", f"Computed archive path: {archive_path}")
-            entries.append(ArchiveBuildEntry(source_path=source_path, archive_path=archive_path))
-
-        log_callback("INFO", f"Total files queued for archive rebuild: {len(entries)}")
-        return tuple(entries)
-
-    def _run_backend_commands(
-        self,
-        commands: tuple[BackendCommand, ...],
-        error_context: str,
-    ) -> None:
-        """Run a sequence of backend commands."""
-        for command in commands:
-            self._run_backend_command(command=command, error_context=error_context)
-
     def _run_backend_command(
         self,
         command: BackendCommand,
         error_context: str,
     ) -> None:
-        """Run a backend command and convert failures into safe user-facing errors."""
         env = dict(os.environ)
         try:
             completed = subprocess.run(
@@ -926,7 +735,6 @@ class MpqHandler:
         command: BackendCommand,
         backend_output: str,
     ) -> str:
-        """Create a detailed backend failure message."""
         parts = [
             error_context,
             (
@@ -943,17 +751,14 @@ class MpqHandler:
         return " ".join(parts)
 
     def _format_command_for_log(self, command: BackendCommand) -> str:
-        """Format a command for logs and error messages."""
         return subprocess.list2cmdline(list(command.args))
 
 
 def _to_mpqeditor_archive_path(archive_path: str) -> str:
-    """Convert a normalized archive path into MPQEditor's preferred separator style."""
     return archive_path.replace("/", "\\")
 
 
 def _normalize_archive_entry_path(archive_entry_path: str) -> str:
-    """Normalize an archive entry path for internal comparisons and commands."""
     normalized = archive_entry_path.strip().replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
