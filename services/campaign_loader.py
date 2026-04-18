@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -12,7 +11,7 @@ from mpq_handler import MpqHandler
 from services.builder import build_campaign
 from services.input_detector import detect_input_type
 from services.map_loader import dispose_map_source, load_map_source
-from utils import ArchiveProcessingError, cleanup_workspace
+from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace
 
 
 def load_campaign_source(
@@ -34,7 +33,7 @@ def load_campaign_source(
 
     log("INFO", "Detecting MPQ backend.")
     handler = MpqHandler.auto_detect()
-    workspace_root = Path(tempfile.mkdtemp(prefix="war3campaign_load_")).resolve()
+    workspace_root = create_temp_workspace("war3campaign_load_", logger=_TempLogger(log))
     extracted_dir = workspace_root / "campaign_contents"
     extracted_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,3 +175,6 @@ class _TempLogger:
 
     def debug(self, message: str, *args: object) -> None:
         self._callback("INFO", message % args if args else message)
+
+    def warning(self, message: str, *args: object) -> None:
+        self._callback("WARNING", message % args if args else message)

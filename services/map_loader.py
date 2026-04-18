@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -11,7 +10,7 @@ from models import InputType, MapSourceContext, MpqBackendType
 from mpq_handler import MpqHandler
 from services.input_detector import detect_input_type
 from services.validator import validate_loaded_map_source
-from utils import ArchiveProcessingError, cleanup_workspace
+from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace
 
 
 KNOWN_SCRIPT_RELATIVE_PATHS = (
@@ -56,7 +55,7 @@ def load_map_source(
     handler = MpqHandler.auto_detect(
         preferred_backend_type=MpqBackendType.MPQEDITOR if resolved_listfiles else None
     )
-    workspace_root = Path(tempfile.mkdtemp(prefix="war3map_load_")).resolve()
+    workspace_root = create_temp_workspace("war3map_load_", logger=_TempLogger(log))
     extracted_dir = workspace_root / "map_contents"
     extracted_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,6 +115,9 @@ class _TempLogger:
 
     def debug(self, message: str, *args: object) -> None:
         self._callback("INFO", message % args if args else message)
+
+    def warning(self, message: str, *args: object) -> None:
+        self._callback("WARNING", message % args if args else message)
 
 
 def _discover_map_script(extracted_root: Path, log_callback=None) -> MapScriptDiscovery:

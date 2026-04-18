@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import logging
 import shutil
+import tempfile
 from pathlib import Path
+
+
+MANAGED_TEMP_PREFIXES: tuple[str, ...] = (
+    "war3map_load_",
+    "war3campaign_load_",
+    "war3campaign_map_build_",
+    "mpq_list_",
+    "mpq_extract_single_",
+)
 
 
 class ToolError(Exception):
@@ -49,15 +59,63 @@ def ensure_output_target_is_safe(
         )
 
 
+def create_temp_workspace(prefix: str, logger: logging.Logger) -> Path:
+    """Create and log a managed temporary workspace directory."""
+    workspace_root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    logger.info("Created temp workspace: %s", workspace_root)
+    return workspace_root
+
+
 def cleanup_workspace(workspace_root: Path, keep: bool, logger: logging.Logger) -> None:
     """Delete or retain the temporary workspace."""
+    cleanup_temp_path(workspace_root, keep=keep, logger=logger, label="temp workspace")
+
+
+def cleanup_temp_path(
+    path: Path,
+    keep: bool,
+    logger: logging.Logger,
+    label: str = "temp path",
+) -> None:
+    """Delete or retain a managed temporary file or directory."""
+    resolved_path = path.expanduser().resolve()
     if keep:
-        logger.info("Keeping temporary workspace: %s", workspace_root)
+        logger.info("Keeping %s: %s", label, resolved_path)
         return
 
-    if workspace_root.exists():
-        shutil.rmtree(workspace_root, ignore_errors=True)
-        logger.debug("Removed temporary workspace: %s", workspace_root)
+    if not resolved_path.exists():
+        return
+
+    if not is_managed_temp_path(resolved_path):
+        logger.warning("Refusing to remove unmanaged %s: %s", label, resolved_path)
+        return
+
+    logger.info("Cleaning %s: %s", label, resolved_path)
+    try:
+        if resolved_path.is_dir():
+            shutil.rmtree(resolved_path)
+        else:
+            resolved_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to remove %s: %s (%s)", label, resolved_path, exc)
+        return
+
+    logger.info("%s removed successfully: %s", label.capitalize(), resolved_path)
+
+
+def is_managed_temp_path(path: Path) -> bool:
+    """Return whether a path belongs to a tool-managed temp location."""
+    resolved_path = path.expanduser().resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        relative_parts = resolved_path.relative_to(temp_root).parts
+    except ValueError:
+        return False
+
+    return any(
+        any(part.startswith(prefix) for prefix in MANAGED_TEMP_PREFIXES)
+        for part in relative_parts
+    )
 
 
 def detect_newline(text: str) -> str:

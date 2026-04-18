@@ -7,7 +7,7 @@ import logging
 import sys
 from pathlib import Path
 
-from models import CampaignBuildSummary, PatchResult, PatchRunOptions, PatchSelection
+from models import CampaignBuildSummary, PatchMode, PatchResult, PatchRunOptions, PatchSelection
 from services.campaign_loader import dispose_campaign_source, list_campaign_maps, load_campaign_source
 from services.injector import inject_and_build, inject_and_build_campaign, summarize_campaign_build
 from services.input_detector import detect_input_type
@@ -82,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose logging output.",
     )
+    parser.add_argument(
+        "--patch-mode",
+        choices=[mode.value for mode in PatchMode],
+        default=PatchMode.AUTO.value,
+        help="Map patch strategy: auto, fast_replace, or full_rebuild.",
+    )
     return parser
 
 
@@ -105,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         keep_temp=args.keep_temp,
         verbose=args.verbose,
         stop_on_first_error=stop_on_first_error,
+        patch_mode=PatchMode(args.patch_mode),
     )
 
     if input_type.is_map:

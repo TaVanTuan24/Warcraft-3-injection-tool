@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -13,12 +12,15 @@ from models import (
     CampaignMapEntry,
     CampaignPatchResult,
     MapSourceContext,
+    MpqBackendType,
+    PatchMode,
     PatchConfig,
     PatchResult,
     PatchRunOptions,
     PatchSelection,
     PatchedSourceResult,
 )
+from mpq_handler import MpqHandler
 from services.builder import build_map
 from services.campaign_loader import (
     build_campaign_archive,
@@ -27,8 +29,8 @@ from services.campaign_loader import (
 )
 from services.input_detector import detect_input_type
 from services.map_loader import dispose_map_source, load_map_source
-from services.validator import validate_before_inject
-from utils import ArchiveProcessingError, ensure_output_target_is_safe
+from services.validator import validate_before_inject, validate_fast_replace_preconditions
+from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace, ensure_output_target_is_safe
 
 
 def selection_to_patch_config(selection: PatchSelection) -> PatchConfig:
@@ -107,6 +109,7 @@ def inject_and_build(
         output_map=output_map,
         selected_patch=selected_patch,
         overwrite=options.overwrite,
+        patch_mode=options.patch_mode,
     )
     if not validation.is_valid:
         raise ValueError("\n".join(validation.issues))
@@ -125,6 +128,7 @@ def inject_and_build(
             output_map=output_map,
             selected_patch=selected_patch,
             overwrite=options.overwrite,
+            patch_mode=options.patch_mode,
             map_source=map_source,
         )
         if not validation.is_valid:
@@ -132,19 +136,15 @@ def inject_and_build(
         for warning in validation.warnings:
             log("WARNING", warning)
         patched_source = inject_patch(map_source, selected_patch)
-
-        progress("injecting globals")
-        progress("injecting functions")
-        progress("injecting main calls")
-        progress("rebuilding archive")
-        build_map(map_source.extracted_dir, output_map, log_callback=log)
-        progress("built")
-        log("SUCCESS", f"Built patched archive: {output_map}")
-        return PatchResult(
-            added_globals=patched_source.patch_result.added_globals,
-            added_functions=patched_source.patch_result.added_functions,
-            added_init_calls=patched_source.patch_result.added_init_calls,
-            output_path=output_map,
+        log("INFO", f"Patch mode selected: {options.patch_mode.label}")
+        return _write_patched_map_archive(
+            input_map=input_map,
+            output_map=output_map,
+            map_source=map_source,
+            patched_source=patched_source,
+            options=options,
+            progress_callback=progress,
+            log_callback=log,
         )
     finally:
         dispose_map_source(map_source, keep=options.keep_temp, log_callback=log)
@@ -163,6 +163,9 @@ def inject_and_build_campaign(
     progress = progress_callback or (lambda _step: None)
     log = log_callback or (lambda _severity, _message: None)
 
+    if options.patch_mode is PatchMode.FAST_REPLACE:
+        log("WARNING", "Campaign patching does not support fast replace. Using full rebuild.")
+
     ensure_output_target_is_safe(
         input_path=campaign_context.input_path,
         output_path=output_campaign,
@@ -173,6 +176,7 @@ def inject_and_build_campaign(
         output_map=output_campaign,
         selected_patch=selected_patch,
         overwrite=options.overwrite,
+        patch_mode=PatchMode.FULL_REBUILD,
         campaign_maps=campaign_context.map_entries,
         stop_on_first_error=options.stop_on_first_error,
     )
@@ -233,17 +237,22 @@ def inject_and_build_campaign(
         )
         try:
             patched_source = inject_patch(map_source, selected_patch)
-            temp_output = (
-                Path(tempfile.mkdtemp(prefix="war3campaign_map_build_")).resolve()
-                / current_entry.map_name
+            temp_output_root = create_temp_workspace(
+                "war3campaign_map_build_",
+                logger=_CallbackLogger(log),
             )
+            temp_output = temp_output_root / current_entry.map_name
             try:
                 log("INFO", f"Rebuilding embedded map: {current_entry.archive_path}")
                 build_map(map_source.extracted_dir, temp_output, log_callback=log)
                 log("INFO", f"Replacing embedded map in campaign: {current_entry.archive_path}")
                 replace_campaign_map(campaign_context, current_entry, temp_output)
             finally:
-                shutil.rmtree(temp_output.parent, ignore_errors=True)
+                cleanup_workspace(
+                    temp_output_root,
+                    keep=options.keep_temp,
+                    logger=_CallbackLogger(log),
+                )
 
             duplicate_counts = _calculate_duplicate_counts(selected_patch, patched_source.effective_selection)
             message = (
@@ -335,6 +344,173 @@ def summarize_campaign_build(summary: CampaignBuildSummary) -> str:
             )
         )
     return "\n".join(lines)
+
+
+def _write_patched_map_archive(
+    input_map: Path,
+    output_map: Path,
+    map_source: MapSourceContext,
+    patched_source: PatchedSourceResult,
+    options: PatchRunOptions,
+    progress_callback=None,
+    log_callback=None,
+) -> PatchResult:
+    progress = progress_callback or (lambda _step: None)
+    log = log_callback or (lambda _severity, _message: None)
+
+    if options.patch_mode is PatchMode.FULL_REBUILD:
+        return _build_patched_map_archive(
+            output_map=output_map,
+            map_source=map_source,
+            patched_source=patched_source,
+            progress_callback=progress,
+            log_callback=log,
+        )
+
+    if options.patch_mode is PatchMode.FAST_REPLACE:
+        return _fast_replace_patched_map_archive(
+            input_map=input_map,
+            output_map=output_map,
+            map_source=map_source,
+            patched_source=patched_source,
+            progress_callback=progress,
+            log_callback=log,
+        )
+
+    try:
+        return _fast_replace_patched_map_archive(
+            input_map=input_map,
+            output_map=output_map,
+            map_source=map_source,
+            patched_source=patched_source,
+            progress_callback=progress,
+            log_callback=log,
+        )
+    except Exception as exc:
+        log("WARNING", f"Fast replace failed, falling back to full rebuild. {exc}")
+        return _build_patched_map_archive(
+            output_map=output_map,
+            map_source=map_source,
+            patched_source=patched_source,
+            progress_callback=progress,
+            log_callback=log,
+        )
+
+
+def _build_patched_map_archive(
+    output_map: Path,
+    map_source: MapSourceContext,
+    patched_source: PatchedSourceResult,
+    progress_callback=None,
+    log_callback=None,
+) -> PatchResult:
+    progress = progress_callback or (lambda _step: None)
+    log = log_callback or (lambda _severity, _message: None)
+
+    progress("injecting globals")
+    progress("injecting functions")
+    progress("injecting main calls")
+    progress("rebuilding archive")
+    log("INFO", "Using full rebuild.")
+    build_map(map_source.extracted_dir, output_map, log_callback=log)
+    progress("built")
+    log("SUCCESS", f"Built patched archive: {output_map}")
+    return PatchResult(
+        added_globals=patched_source.patch_result.added_globals,
+        added_functions=patched_source.patch_result.added_functions,
+        added_init_calls=patched_source.patch_result.added_init_calls,
+        output_path=output_map,
+    )
+
+
+def _fast_replace_patched_map_archive(
+    input_map: Path,
+    output_map: Path,
+    map_source: MapSourceContext,
+    patched_source: PatchedSourceResult,
+    progress_callback=None,
+    log_callback=None,
+) -> PatchResult:
+    progress = progress_callback or (lambda _step: None)
+    log = log_callback or (lambda _severity, _message: None)
+
+    progress("validating fast replace")
+    log("INFO", "Using fast replace.")
+    handler = MpqHandler.auto_detect(preferred_backend_type=MpqBackendType.MPQEDITOR)
+    validation = validate_fast_replace_preconditions(
+        input_map=input_map,
+        map_source=map_source,
+        patched_script_path=map_source.script_path,
+        handler=handler,
+    )
+    if not validation.is_valid:
+        raise ArchiveProcessingError(" ".join(validation.issues))
+    for warning in validation.warnings:
+        log("WARNING", warning)
+
+    progress("copying output archive")
+    log("INFO", f"Copying input archive to output archive: {input_map} -> {output_map}")
+    target_archive, copied_to_temp = _prepare_fast_replace_output(
+        input_map=input_map,
+        output_map=output_map,
+        workspace_root=map_source.workspace_root,
+    )
+    succeeded = False
+    try:
+        script_entry_path = map_source.script_relative_path.as_posix()
+        progress("replacing script in archive")
+        log("INFO", f"Locating script entry: {script_entry_path}")
+        log("INFO", f"Replacing script entry in archive: {script_entry_path}")
+        handler.replace_file_in_archive(
+            archive_path=target_archive,
+            archive_entry_path=script_entry_path,
+            local_file_path=map_source.script_path,
+        )
+        if copied_to_temp:
+            shutil.copy2(target_archive, output_map)
+        succeeded = True
+        progress("built")
+        log("SUCCESS", f"Fast replace succeeded: {output_map}")
+        return PatchResult(
+            added_globals=patched_source.patch_result.added_globals,
+            added_functions=patched_source.patch_result.added_functions,
+            added_init_calls=patched_source.patch_result.added_init_calls,
+            output_path=output_map,
+        )
+    finally:
+        if copied_to_temp:
+            target_archive.unlink(missing_ok=True)
+        elif not succeeded and target_archive.exists():
+            target_archive.unlink(missing_ok=True)
+
+
+def _prepare_fast_replace_output(
+    input_map: Path,
+    output_map: Path,
+    workspace_root: Path,
+) -> tuple[Path, bool]:
+    output_map.parent.mkdir(parents=True, exist_ok=True)
+    if input_map.resolve() != output_map.resolve():
+        shutil.copy2(input_map, output_map)
+        return output_map, False
+
+    temp_output = workspace_root / f"__fast_replace_copy{output_map.suffix}"
+    shutil.copy2(input_map, temp_output)
+    return temp_output, True
+
+
+class _CallbackLogger:
+    def __init__(self, callback) -> None:
+        self._callback = callback
+
+    def info(self, message: str, *args: object) -> None:
+        self._callback("INFO", message % args if args else message)
+
+    def debug(self, message: str, *args: object) -> None:
+        self._callback("INFO", message % args if args else message)
+
+    def warning(self, message: str, *args: object) -> None:
+        self._callback("WARNING", message % args if args else message)
 
 
 def _calculate_duplicate_counts(

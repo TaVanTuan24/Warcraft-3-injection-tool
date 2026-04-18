@@ -12,7 +12,7 @@ from typing import Sequence
 
 from app_paths import app_root, bundle_root
 from models import MpqBackendInfo, MpqBackendType
-from utils import ArchiveProcessingError, to_archive_path
+from utils import ArchiveProcessingError, cleanup_workspace, create_temp_workspace, to_archive_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -47,6 +47,11 @@ class BaseMpqBackendAdapter:
 
     backend_type: MpqBackendType
     backend_name: str
+    supports_list_entries = False
+    supports_extract_single_file = False
+    supports_delete_entry = False
+    supports_add_entry = False
+    supports_replace_entry = False
 
     def build_test_command(self, backend: MpqBackendInfo) -> BackendCommand:
         """Return a lightweight command that validates backend execution."""
@@ -121,6 +126,11 @@ class MpqEditorBackendAdapter(BaseMpqBackendAdapter):
 
     backend_type = MpqBackendType.MPQEDITOR
     backend_name = "MPQEditor"
+    supports_list_entries = True
+    supports_extract_single_file = True
+    supports_delete_entry = True
+    supports_add_entry = True
+    supports_replace_entry = True
 
     def build_test_command(self, backend: MpqBackendInfo) -> BackendCommand:
         return BackendCommand(args=(str(backend.executable), "version"))
@@ -341,6 +351,232 @@ class MpqHandler:
             destination_dir=destination_dir,
             external_listfiles=external_listfiles,
         )
+
+    def supports_list_entries(self) -> bool:
+        """Return whether the backend can enumerate archive entries."""
+        return bool(self._adapter.supports_list_entries)
+
+    def supports_extract_single_file(self) -> bool:
+        """Return whether the backend can extract a single archive entry."""
+        return bool(self._adapter.supports_extract_single_file)
+
+    def supports_delete_entry(self) -> bool:
+        """Return whether the backend can delete a single archive entry."""
+        return bool(self._adapter.supports_delete_entry)
+
+    def supports_add_entry(self) -> bool:
+        """Return whether the backend can add a single archive entry."""
+        return bool(self._adapter.supports_add_entry)
+
+    def supports_replace_entry(self) -> bool:
+        """Return whether the backend can replace a single archive entry."""
+        return bool(self._adapter.supports_replace_entry)
+
+    def supports_fast_replace(self) -> bool:
+        """Return whether the backend supports the fast script-replace workflow."""
+        return (
+            self.supports_list_entries()
+            and self.supports_delete_entry()
+            and self.supports_add_entry()
+            and self.supports_replace_entry()
+        )
+
+    def list_archive_entries(self, archive_path: Path) -> tuple[str, ...]:
+        """List normalized archive entry paths."""
+        self._validate_input_archive_path(archive_path)
+        if not self.supports_list_entries():
+            raise ArchiveProcessingError(
+                f"Backend '{self.backend.name}' does not support archive entry listing."
+            )
+
+        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
+            temp_dir = create_temp_workspace("mpq_list_", logger=LOGGER)
+            output_path = temp_dir / "entries.txt"
+            try:
+                command = BackendCommand(
+                    args=(
+                        str(self.backend.executable),
+                        "list",
+                        str(archive_path),
+                        "*",
+                        str(output_path),
+                    )
+                )
+                self._run_backend_command(
+                    command=command,
+                    error_context="Failed to list archive entries.",
+                )
+                if not output_path.is_file():
+                    raise ArchiveProcessingError(
+                        f"Backend did not produce an archive listing for {archive_path}."
+                    )
+                entries = []
+                for raw_line in output_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines():
+                    entry = _normalize_archive_entry_path(raw_line)
+                    if entry:
+                        entries.append(entry)
+                return tuple(entries)
+            finally:
+                cleanup_workspace(temp_dir, keep=False, logger=LOGGER)
+
+        raise ArchiveProcessingError(
+            f"Archive entry listing is not implemented for backend '{self.backend.name}'."
+        )
+
+    def extract_file_from_archive(
+        self,
+        archive_path: Path,
+        archive_entry_path: str,
+        output_path: Path,
+    ) -> None:
+        """Extract one archive entry into a local file path."""
+        self._validate_input_archive_path(archive_path)
+        if not self.supports_extract_single_file():
+            raise ArchiveProcessingError(
+                f"Backend '{self.backend.name}' does not support single-file extraction."
+            )
+
+        normalized_entry = _normalize_archive_entry_path(archive_entry_path)
+        if not normalized_entry:
+            raise ArchiveProcessingError("Archive entry path is required for single-file extraction.")
+
+        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
+            temp_dir = create_temp_workspace("mpq_extract_single_", logger=LOGGER)
+            try:
+                command = BackendCommand(
+                    args=(
+                        str(self.backend.executable),
+                        "extract",
+                        str(archive_path),
+                        _to_mpqeditor_archive_path(normalized_entry),
+                        str(temp_dir),
+                        "/fp",
+                    )
+                )
+                self._run_backend_command(
+                    command=command,
+                    error_context="Failed to extract the requested archive entry.",
+                )
+                extracted_path = temp_dir / Path(normalized_entry)
+                if not extracted_path.is_file():
+                    raise ArchiveProcessingError(
+                        f"Backend did not extract the requested archive entry: {normalized_entry}"
+                    )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(extracted_path, output_path)
+                return
+            finally:
+                cleanup_workspace(temp_dir, keep=False, logger=LOGGER)
+
+        raise ArchiveProcessingError(
+            f"Single-file extraction is not implemented for backend '{self.backend.name}'."
+        )
+
+    def delete_file_in_archive(self, archive_path: Path, archive_entry_path: str) -> None:
+        """Delete one entry from an archive."""
+        self._validate_input_archive_path(archive_path)
+        if not self.supports_delete_entry():
+            raise ArchiveProcessingError(
+                f"Backend '{self.backend.name}' does not support deleting archive entries."
+            )
+
+        normalized_entry = _normalize_archive_entry_path(archive_entry_path)
+        if not normalized_entry:
+            raise ArchiveProcessingError("Archive entry path is required for delete.")
+
+        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
+            command = BackendCommand(
+                args=(
+                    str(self.backend.executable),
+                    "delete",
+                    str(archive_path),
+                    _to_mpqeditor_archive_path(normalized_entry),
+                )
+            )
+            self._run_backend_command(
+                command=command,
+                error_context=f"Failed to delete archive entry '{normalized_entry}'.",
+            )
+            return
+
+        raise ArchiveProcessingError(
+            f"Archive entry deletion is not implemented for backend '{self.backend.name}'."
+        )
+
+    def add_file_to_archive(
+        self,
+        archive_path: Path,
+        archive_entry_path: str,
+        local_file_path: Path,
+    ) -> None:
+        """Add one local file into an archive entry path."""
+        self._validate_input_archive_path(archive_path)
+        if not self.supports_add_entry():
+            raise ArchiveProcessingError(
+                f"Backend '{self.backend.name}' does not support adding archive entries."
+            )
+        if not local_file_path.is_file():
+            raise ArchiveProcessingError(f"Local file for archive add was not found: {local_file_path}")
+
+        normalized_entry = _normalize_archive_entry_path(archive_entry_path)
+        if not normalized_entry:
+            raise ArchiveProcessingError("Archive entry path is required for add.")
+
+        if self.backend.backend_type is MpqBackendType.MPQEDITOR:
+            command = BackendCommand(
+                args=(
+                    str(self.backend.executable),
+                    "add",
+                    str(archive_path),
+                    str(local_file_path),
+                    _to_mpqeditor_archive_path(normalized_entry),
+                )
+            )
+            self._run_backend_command(
+                command=command,
+                error_context=f"Failed to add archive entry '{normalized_entry}'.",
+            )
+            return
+
+        raise ArchiveProcessingError(
+            f"Archive entry add is not implemented for backend '{self.backend.name}'."
+        )
+
+    def replace_file_in_archive(
+        self,
+        archive_path: Path,
+        archive_entry_path: str,
+        local_file_path: Path,
+    ) -> None:
+        """Replace one archive entry with a local file."""
+        self._validate_input_archive_path(archive_path)
+        if not self.supports_replace_entry():
+            raise ArchiveProcessingError(
+                f"Backend '{self.backend.name}' does not support replacing archive entries."
+            )
+        if not local_file_path.is_file():
+            raise ArchiveProcessingError(
+                f"Patched script file does not exist: {local_file_path}"
+            )
+
+        normalized_entry = _normalize_archive_entry_path(archive_entry_path)
+        entries = set(self.list_archive_entries(archive_path))
+        if normalized_entry not in entries:
+            raise ArchiveProcessingError(
+                f"Archive entry not found for fast replace: {normalized_entry}"
+            )
+
+        self.delete_file_in_archive(archive_path, normalized_entry)
+        self.add_file_to_archive(archive_path, normalized_entry, local_file_path)
+
+        updated_entries = set(self.list_archive_entries(archive_path))
+        if normalized_entry not in updated_entries:
+            raise ArchiveProcessingError(
+                f"Fast replace did not restore the expected archive entry: {normalized_entry}"
+            )
 
     def rebuild_archive(self, source_dir: Path, output_path: Path, log_callback=None) -> None:
         """Rebuild a supported Warcraft 3 archive from an extracted directory."""
@@ -565,3 +801,15 @@ class MpqHandler:
 def _to_mpqeditor_archive_path(archive_path: str) -> str:
     """Convert a normalized archive path into MPQEditor's preferred separator style."""
     return archive_path.replace("/", "\\")
+
+
+def _normalize_archive_entry_path(archive_entry_path: str) -> str:
+    """Normalize an archive entry path for internal comparisons and commands."""
+    normalized = archive_entry_path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    while normalized.startswith("/"):
+        normalized = normalized[1:]
+    if normalized in {"", ".", "./", ".\\"}:
+        return ""
+    return normalized

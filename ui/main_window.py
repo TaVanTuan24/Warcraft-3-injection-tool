@@ -32,6 +32,7 @@ from models import (
     InputType,
     MainCallEntry,
     MapSourceContext,
+    PatchMode,
     PatchResult,
     PatchRunOptions,
     PatchSelection,
@@ -374,6 +375,9 @@ class MainWindow(QMainWindow):
         self.reset_button = QPushButton("Reset")
         self.overwrite_checkbox = QCheckBox("Overwrite output")
         self.keep_temp_checkbox = QCheckBox("Keep temp workspace")
+        self.patch_mode_combo = QComboBox()
+        for mode in PatchMode:
+            self.patch_mode_combo.addItem(mode.label, mode)
 
         self.load_input_button.clicked.connect(self._load_input_source)
         self.scan_trigger_button.clicked.connect(self._scan_trigger_files)
@@ -413,6 +417,9 @@ class MainWindow(QMainWindow):
         self.inject_button.setMinimumWidth(152)
         self.save_preset_button.setMinimumWidth(152)
         self.load_preset_button.setMinimumWidth(152)
+        self.patch_mode_combo.setToolTip(
+            "Choose whether to try fast in-place script replacement, force full rebuild, or let Auto decide."
+        )
 
         primary_row = QHBoxLayout()
         primary_row.setContentsMargins(0, 0, 0, 0)
@@ -427,6 +434,8 @@ class MainWindow(QMainWindow):
         for button in library_buttons:
             secondary_row.addWidget(button)
         secondary_row.addSpacing(12)
+        secondary_row.addWidget(QLabel("Patch mode"))
+        secondary_row.addWidget(self.patch_mode_combo)
         secondary_row.addWidget(self.overwrite_checkbox)
         secondary_row.addWidget(self.keep_temp_checkbox)
         secondary_row.addStretch(1)
@@ -888,6 +897,7 @@ class MainWindow(QMainWindow):
             output_map=self._output_path(),
             selected_patch=self._selection,
             overwrite=self.overwrite_checkbox.isChecked(),
+            patch_mode=self._selected_patch_mode(),
             map_source=self._map_source_context,
             source_text=self._loaded_map_text,
             campaign_maps=self.campaign_map_table.entries() if self._input_type == InputType.CAMPAIGN_W3N else None,
@@ -943,6 +953,7 @@ class MainWindow(QMainWindow):
                 overwrite=overwrite,
                 keep_temp=self.keep_temp_checkbox.isChecked(),
                 stop_on_first_error=self._stop_on_first_error(),
+                patch_mode=self._selected_patch_mode(),
             ),
         }
         if self._input_type == InputType.CAMPAIGN_W3N:
@@ -1000,6 +1011,7 @@ class MainWindow(QMainWindow):
         self.listfile_list.clear()
         self.input_path_edit.setText("")
         self.output_path_edit.setText("")
+        self.patch_mode_combo.setCurrentIndex(0)
         self.overwrite_checkbox.setChecked(False)
         self.keep_temp_checkbox.setChecked(False)
         self.campaign_map_table.set_entries([])
@@ -1023,6 +1035,10 @@ class MainWindow(QMainWindow):
 
     def _external_listfiles(self) -> tuple[Path, ...]:
         return tuple(Path(path).expanduser().resolve() for path in self._listfiles)
+
+    def _selected_patch_mode(self) -> PatchMode:
+        mode = self.patch_mode_combo.currentData()
+        return mode if isinstance(mode, PatchMode) else PatchMode.AUTO
 
     def _stop_on_first_error(self) -> bool:
         return self.campaign_failure_combo.currentIndex() == 1
@@ -1106,6 +1122,7 @@ class MainWindow(QMainWindow):
         self._update_ui_state()
 
     def _on_inject_build_completed(self, result) -> None:
+        self._release_loaded_input_source()
         if isinstance(result, CampaignBuildSummary):
             summary_text = summarize_campaign_build(result)
             self._append_log("SUCCESS", summary_text)
@@ -1134,6 +1151,8 @@ class MainWindow(QMainWindow):
         self._update_ui_state()
 
     def _on_worker_failed(self, message: str) -> None:
+        if self._worker is not None and self._worker.mode == "inject-build":
+            self._release_loaded_input_source()
         self._append_log("ERROR", message)
         show_error(self, "Operation Failed", message)
         self.status_run_label.setText("State: Failed")
@@ -1230,11 +1249,13 @@ class MainWindow(QMainWindow):
             self.campaign_status_label.setText(self._format_campaign_status())
 
         input_type_label = self._input_type.name if self._input_type is not None else "unknown"
+        patch_mode_label = self._selected_patch_mode().label
         self.validation_label.setText(
             " | ".join(
                 [
                     f"Input: {'ready' if input_valid else 'missing'}",
                     f"Type: {input_type_label}",
+                    f"Patch mode: {patch_mode_label}",
                     f"Output: {'ready' if output_valid else 'missing/invalid'}",
                     f"Trigger files: {len(self._trigger_files)}",
                     f"Listfiles: {listfile_count}",
@@ -1268,6 +1289,7 @@ class MainWindow(QMainWindow):
         self.select_all_maps_button.setEnabled(campaign_mode and bool(self.campaign_map_table.entries()) and not worker_running)
         self.unselect_all_maps_button.setEnabled(campaign_mode and bool(self.campaign_map_table.entries()) and not worker_running)
         self.campaign_failure_combo.setEnabled(campaign_mode and not worker_running)
+        self.patch_mode_combo.setEnabled(not worker_running)
         self.save_preset_button.setEnabled(not worker_running)
         self.load_preset_button.setEnabled(not worker_running)
         self.reset_button.setEnabled(not worker_running)

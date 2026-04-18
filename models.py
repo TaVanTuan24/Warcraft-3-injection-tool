@@ -108,6 +108,23 @@ class InputType(str, Enum):
         return self in (InputType.MAP_W3X, InputType.MAP_W3M)
 
 
+class PatchMode(str, Enum):
+    """Supported archive patch strategies."""
+
+    AUTO = "auto"
+    FAST_REPLACE = "fast_replace"
+    FULL_REBUILD = "full_rebuild"
+
+    @property
+    def label(self) -> str:
+        labels = {
+            PatchMode.AUTO: "Auto",
+            PatchMode.FAST_REPLACE: "Fast Replace",
+            PatchMode.FULL_REBUILD: "Full Rebuild",
+        }
+        return labels[self]
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveInputContext:
     """Generic archive input metadata."""
@@ -143,6 +160,7 @@ class PatchRunOptions:
     keep_temp: bool = False
     verbose: bool = False
     stop_on_first_error: bool = False
+    patch_mode: PatchMode = PatchMode.AUTO
 
 
 @dataclass(frozen=True, slots=True)
