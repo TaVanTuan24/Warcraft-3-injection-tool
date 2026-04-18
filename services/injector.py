@@ -461,10 +461,11 @@ def _fast_replace_patched_map_archive(
         progress("replacing script in archive")
         log("INFO", f"Locating script entry: {script_entry_path}")
         log("INFO", f"Replacing script entry in archive: {script_entry_path}")
-        handler.replace_file_in_archive(
+        handler.replace_file_in_archive_with_listfiles(
             archive_path=target_archive,
             archive_entry_path=script_entry_path,
             local_file_path=map_source.script_path,
+            external_listfiles=map_source.external_listfiles,
         )
         if copied_to_temp:
             shutil.copy2(target_archive, output_map)

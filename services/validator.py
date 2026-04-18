@@ -254,7 +254,12 @@ def validate_fast_replace_preconditions(
     if issues:
         return ValidationResult(is_valid=False, issues=issues, warnings=warnings)
 
-    archive_entries = set(handler.list_archive_entries(input_map))
+    archive_entries = set(
+        handler.list_archive_entries_with_listfiles(
+            input_map,
+            external_listfiles=map_source.external_listfiles,
+        )
+    )
     if script_entry_path not in archive_entries:
         issues.append(
             f"Detected script entry was not found inside the archive: {script_entry_path}"
