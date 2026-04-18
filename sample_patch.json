@@ -1,0 +1,14 @@
+{
+  "globals_to_add": [
+    "integer udg_CustomValue = 0",
+    "trigger gg_trg_CustomTrigger = null"
+  ],
+  "functions_to_add": [
+    "function InitCustomTriggerA takes nothing returns nothing\n    // TODO\nendfunction",
+    "function InitCustomTriggerB takes nothing returns nothing\n    // TODO\nendfunction"
+  ],
+  "init_calls": [
+    "call InitCustomTriggerA()",
+    "call InitCustomTriggerB()"
+  ]
+}

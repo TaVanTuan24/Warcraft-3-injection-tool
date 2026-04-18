@@ -1,0 +1,161 @@
+"""Validation services for the trigger injector."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from jass_patcher import get_effective_patch_config
+from models import CampaignMapEntry, InputType, PatchConfig, PatchSelection, ValidationResult
+from services.input_detector import detect_input_type
+from utils import ensure_output_target_is_safe
+
+
+GLOBALS_PATTERN = re.compile(r"^[ \t]*globals\b", re.IGNORECASE | re.MULTILINE)
+MAIN_PATTERN = re.compile(
+    r"^[ \t]*function[ \t]+main[ \t]+takes[ \t]+nothing[ \t]+returns[ \t]+nothing\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def validate_map_source_text(source_text: str) -> list[str]:
+    """Validate the required structures inside a target map source file."""
+    issues: list[str] = []
+    if not GLOBALS_PATTERN.search(source_text):
+        issues.append("Missing required 'globals ... endglobals' block.")
+    if not MAIN_PATTERN.search(source_text):
+        issues.append("Missing required 'function main takes nothing returns nothing' declaration.")
+    return issues
+
+
+def validate_before_inject(
+    input_map: Path | None,
+    output_map: Path | None,
+    selected_patch: PatchSelection,
+    overwrite: bool = False,
+    source_text: str | None = None,
+    campaign_maps: list[CampaignMapEntry] | None = None,
+    stop_on_first_error: bool = False,
+) -> ValidationResult:
+    """Validate the current job before injection begins."""
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    input_type: InputType | None = None
+    if input_map is None:
+        issues.append("Input archive path is required.")
+    elif not input_map.is_file():
+        issues.append(f"Input file not found: {input_map}")
+    else:
+        try:
+            input_type = detect_input_type(input_map)
+        except Exception as exc:
+            issues.append(str(exc))
+
+    if output_map is None:
+        issues.append("Output archive path is required.")
+    elif input_type is not None and output_map.suffix.lower() != input_type.suffix:
+        issues.append(
+            f"Output file must use the {input_type.suffix} extension for this input type."
+        )
+
+    if input_map and output_map and input_map.exists():
+        try:
+            ensure_output_target_is_safe(input_map, output_map, overwrite)
+        except (FileNotFoundError, ValueError) as exc:
+            issues.append(str(exc))
+
+    if not (
+        selected_patch.enabled_globals()
+        or selected_patch.enabled_functions()
+        or selected_patch.enabled_main_calls()
+    ):
+        issues.append("At least one imported trigger item must be enabled before injection.")
+
+    issues.extend(_find_duplicate_issues(selected_patch))
+
+    if input_type is None:
+        return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
+
+    if input_type.is_map:
+        if source_text is not None:
+            issues.extend(validate_map_source_text(source_text))
+            warnings.extend(_effective_warnings(source_text, selected_patch))
+    else:
+        campaign_entries = campaign_maps or []
+        if not campaign_entries:
+            issues.append("Campaign scan results are required before campaign injection.")
+            return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
+
+        selected_entries = [entry for entry in campaign_entries if entry.selected]
+        if not selected_entries:
+            issues.append("At least one campaign map must be selected before injection.")
+        for entry in selected_entries:
+            if entry.patchable:
+                continue
+            if stop_on_first_error:
+                issues.append(
+                    f"Selected campaign map is unreadable or unpatchable: {entry.archive_path}. {entry.message}"
+                )
+            else:
+                warnings.append(
+                    f"Selected campaign map will be skipped if it fails: {entry.archive_path}. {entry.message}"
+                )
+
+    return ValidationResult(is_valid=not issues, issues=issues, warnings=warnings)
+
+
+def _effective_warnings(source_text: str, selected_patch: PatchSelection) -> list[str]:
+    warnings: list[str] = []
+    try:
+        effective = get_effective_patch_config(
+            source_text,
+            PatchConfig(
+                globals_to_add=[entry.text for entry in selected_patch.enabled_globals()],
+                functions_to_add=[entry.text for entry in selected_patch.enabled_functions()],
+                init_calls=[entry.text for entry in selected_patch.enabled_main_calls()],
+            ),
+        )
+        if not (effective.globals_to_add or effective.functions_to_add or effective.init_calls):
+            warnings.append(
+                "No new insertions are pending. The selected target may already contain all enabled entries."
+            )
+    except Exception as exc:
+        return [str(exc)]
+    return warnings
+
+
+def _find_duplicate_issues(selected_patch: PatchSelection) -> list[str]:
+    issues: list[str] = []
+
+    globals_seen: set[str] = set()
+    globals_dupes: set[str] = set()
+    for entry in selected_patch.enabled_globals():
+        candidate = entry.text.strip()
+        if candidate in globals_seen:
+            globals_dupes.add(candidate)
+        globals_seen.add(candidate)
+    if globals_dupes:
+        issues.append("Duplicate enabled globals: " + ", ".join(sorted(globals_dupes)))
+
+    functions_seen: set[str] = set()
+    functions_dupes: set[str] = set()
+    for entry in selected_patch.enabled_functions():
+        candidate = entry.signature
+        if candidate in functions_seen:
+            functions_dupes.add(entry.name or entry.signature)
+        functions_seen.add(candidate)
+    if functions_dupes:
+        issues.append("Duplicate enabled functions: " + ", ".join(sorted(functions_dupes)))
+
+    calls_seen: set[str] = set()
+    calls_dupes: set[str] = set()
+    for entry in selected_patch.enabled_main_calls():
+        candidate = entry.text.strip()
+        if candidate in calls_seen:
+            calls_dupes.add(candidate)
+        calls_seen.add(candidate)
+    if calls_dupes:
+        issues.append("Duplicate enabled main calls: " + ", ".join(sorted(calls_dupes)))
+
+    return issues
