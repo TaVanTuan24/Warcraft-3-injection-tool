@@ -40,6 +40,7 @@ from models import (
     ValidationResult,
     make_id,
 )
+from app_paths import get_app_directory
 from patch_config import load_patch_preset, save_patch_preset
 from services.campaign_loader import dispose_campaign_source
 from services.injector import effective_selection_for_map, inject_and_build_campaign, summarize_campaign_build
@@ -101,6 +102,8 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._sync_raw_editors_from_selection()
         self._update_ui_state()
+        self._auto_load_default_trigger_file()
+        self._auto_load_default_listfile()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -559,6 +562,46 @@ class MainWindow(QMainWindow):
                 added += 1
         self._append_log("INFO", f"Added {added} trigger file(s).")
         self._update_ui_state()
+
+    def _auto_load_default_trigger_file(self) -> None:
+        """Automatically load trigger.j from the app directory when present."""
+        trigger_path = get_app_directory() / "trigger.j"
+        if not trigger_path.is_file():
+            self._append_log("INFO", f"No startup trigger file found at: {trigger_path}")
+            return
+
+        normalized_path = str(trigger_path.resolve())
+        if normalized_path in self._trigger_files:
+            self._append_log("INFO", f"Startup trigger file already loaded: {normalized_path}")
+            return
+
+        try:
+            imported = parse_trigger_file(trigger_path.resolve())
+        except Exception as exc:
+            self._append_log("WARNING", f"Failed to auto-load trigger file '{trigger_path}': {exc}")
+            self._update_ui_state()
+            return
+
+        self._trigger_files.append(normalized_path)
+        self.trigger_file_list.addItem(normalized_path)
+        self._apply_imported_trigger_results([imported], source_label=f"Auto-loaded trigger file: {normalized_path}")
+
+    def _auto_load_default_listfile(self) -> None:
+        """Automatically load listfile.txt from the app directory when present."""
+        listfile_path = get_app_directory() / "listfile.txt"
+        if not listfile_path.is_file():
+            self._append_log("INFO", f"No startup listfile found at: {listfile_path}")
+            return
+
+        normalized_path = str(listfile_path.resolve())
+        if normalized_path in self._listfiles:
+            self._append_log("INFO", f"Startup listfile already loaded: {normalized_path}")
+            return
+
+        self._listfiles.append(normalized_path)
+        self.listfile_list.addItem(normalized_path)
+        self._append_log("INFO", f"Auto-loaded listfile: {normalized_path}")
+        self._on_archive_options_changed()
 
     def _add_listfiles(self) -> None:
         paths = select_open_files(
@@ -1086,13 +1129,20 @@ class MainWindow(QMainWindow):
         self.status_run_label.setText(f"State: {step}")
 
     def _on_scan_completed(self, imported_results: list[TriggerImportResult]) -> None:
+        self._apply_imported_trigger_results(imported_results, source_label="Trigger scan complete.")
+
+    def _apply_imported_trigger_results(
+        self,
+        imported_results: list[TriggerImportResult],
+        source_label: str,
+    ) -> None:
         self._selection = PatchSelection.empty()
         for imported in imported_results:
             self._selection.extend_from_import(imported)
         self._sync_raw_editors_from_selection()
         self._refresh_structured_views()
         self._refresh_preview()
-        self._append_log("SUCCESS", "Trigger scan complete.")
+        self._append_log("SUCCESS", source_label)
         self.status_run_label.setText("State: Scanned")
         self._update_ui_state()
 

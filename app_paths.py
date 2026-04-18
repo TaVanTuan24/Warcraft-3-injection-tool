@@ -25,6 +25,11 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_app_directory() -> Path:
+    """Return the directory containing the running app or packaged executable."""
+    return app_root()
+
+
 def resource_path(*parts: str) -> Path:
     """Resolve a bundled resource path that works in source and frozen mode."""
     return bundle_root().joinpath(*parts)
